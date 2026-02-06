@@ -49,7 +49,7 @@ Notes:
 
 ## Running a Task
 1. Confirm the Task Package exists and is complete.
-2. Ask the user (via `AskUserQuestion`) which model to run (`gpt-5.2-codex` or `gpt-5.2`) AND which reasoning effort to use (`xhigh`, `high`, `medium`, or `low`) in a **single prompt with two questions**.
+2. Ask the user (via `AskUserQuestion`) which model to run (`gpt-5.3-codex` or `gpt-5.3`) AND which reasoning effort to use (`xhigh`, `high`, `medium`, or `low`) in a **single prompt with two questions**.
 3. Select the sandbox mode required for the task; default to `--sandbox read-only` unless edits or network access are necessary.
 4. Assemble the command with the appropriate options:
    - `-m, --model <MODEL>`
