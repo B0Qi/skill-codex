@@ -108,16 +108,10 @@ git merge --no-ff cx/<task>
 - If an agent discovers it needs to modify a file owned by the other, it must **stop and signal** rather than edit directly.
 
 #### Worktree Session Management
-- In parallel mode, prefer explicit session IDs over `resume --last` to avoid cross-worktree ambiguity.
-- After launching Codex, record the session ID in `.coord/sessions.json`:
-  ```bash
-  # Capture session ID from Codex output (look for session_id in output)
-  # Then record it:
-  echo '{"codex_worktree": "../<project>-codex", "session_id": "<SESSION_ID>"}' > .coord/sessions.json
-  ```
+- Uses the shared **Session Registry** (`.coord/sessions.jsonl`). In parallel mode, each worktree's Codex session gets its own registry entry with `mode: parallel` and the worktree `cwd`.
 - Resume Codex in its worktree using the recorded session ID:
   ```bash
-  echo "continue with XYZ" | codex exec -C ../<project>-codex \
+  echo "<resume prompt>" | codex exec -C ../<project>-codex \
     --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null
   ```
 
@@ -129,7 +123,7 @@ For parallel mode, use a `.coord/` directory in the project root to coordinate s
 | --- | --- |
 | `.coord/plan.yaml` | Task split, subtask assignments, file ownership |
 | `.coord/claims.yaml` | Active file/module claims per agent |
-| `.coord/sessions.json` | Worktree path → Codex session ID mapping |
+| `.coord/sessions.jsonl` | Session registry (shared across serial and parallel modes) |
 | `.coord/events.jsonl` | Append-only event log (handoff, blocked, done) |
 
 **Event format:**
@@ -158,6 +152,85 @@ git worktree remove ../<project>-codex
 git branch -d cc/<task> cx/<task> int/<task>
 rm -rf .coord/
 ```
+
+## Session Registry
+
+Codex sessions are persistent (`~/.codex/sessions/`) and can be resumed by ID at any time. To survive timeouts, context loss, and long-running tasks, Claude Code maintains a **session registry** — a lightweight mapping from session IDs to task descriptions.
+
+### Registry File
+
+Use `.coord/sessions.jsonl` (append-only, one JSON object per line). Initialize `.coord/` if it does not exist:
+
+```bash
+mkdir -p .coord
+grep -qxF '.coord/' .git/info/exclude 2>/dev/null || echo '.coord/' >> .git/info/exclude
+```
+
+### Registry Entry Format
+
+Append one line per Codex session:
+
+```json
+{"session_id":"<ID>","task":"<short task description>","status":"running","cwd":"<working dir>","mode":"serial","created_at":"<ISO8601>"}
+```
+
+**Fields:**
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `session_id` | yes | Codex session ID (extract from output or `~/.codex/sessions/`) |
+| `task` | yes | One-line description of what this session is doing |
+| `status` | yes | `running`, `paused`, `done`, `failed` |
+| `cwd` | yes | Working directory (main project root or worktree path) |
+| `mode` | yes | `serial` or `parallel` |
+| `created_at` | yes | ISO 8601 timestamp |
+| `branch` | parallel only | Branch name (`cx/<task>`) |
+| `updated_at` | no | Last status change timestamp |
+| `notes` | no | Free-form context (blockers, partial results, etc.) |
+
+### Registry Lifecycle
+
+1. **On launch**: after running `codex exec`, extract the session ID and append a registry entry with `status: running`.
+2. **On completion**: update the entry's status to `done`.
+3. **On timeout/interrupt**: status stays `running` — on next interaction, Claude Code reads the registry, finds the active session, and resumes it.
+4. **On failure**: update status to `failed`, add error details to `notes`.
+
+### Extracting Session ID
+
+From `~/.codex/sessions/`:
+```bash
+# Find the most recent session file and extract its ID
+find ~/.codex/sessions -name '*.jsonl' -newer .coord/sessions.jsonl -print0 2>/dev/null \
+  | xargs -0 ls -t | head -1 \
+  | xargs jq -r 'select(.type=="session_meta") | .payload.id'
+```
+
+### Context Recovery
+
+When Claude Code loses context (conversation compression, new session, etc.):
+1. Read `.coord/sessions.jsonl` to find sessions with `status: running`.
+2. Read the original Task Package (if saved in `.coord/` or conversation).
+3. Resume the session with a status-check prompt (see Resume Protocol below).
+
+## Resume Protocol
+
+When resuming a Codex session (whether after timeout, context loss, or user-initiated), always use this protocol:
+
+1. **Resume with a self-check prompt.** The first message to a resumed session must ask Codex to summarize its current state:
+   ```
+   Resume. Before continuing, output a brief status summary:
+   1. What has been completed so far
+   2. What files were modified
+   3. What remains to be done
+   4. Any blockers or decisions needed
+   Then continue with the remaining work.
+   ```
+2. **Use explicit session ID**, not `--last`:
+   ```bash
+   echo "<resume prompt>" | codex exec --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null
+   ```
+3. **After timeout or error**: temporarily remove `2>/dev/null` on the next resume to capture any diagnostic output, then re-add it once confirmed working.
+4. **Update the registry** after resume completes (status, updated_at, notes).
 
 ## Task Package Format (Standard Prompt Template)
 Codex must receive a normalized Task Package. If missing, ask Claude Code to supply it.
@@ -203,13 +276,14 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
    - `-C, --cd <DIR>` (use worktree path for parallel mode)
    - `--skip-git-repo-check`
 5. Always use `--skip-git-repo-check`.
-6. When continuing a previous session, use `codex exec --skip-git-repo-check resume --last` via stdin. When resuming, don't use any configuration flags unless explicitly requested by the user (e.g., model or reasoning effort). Resume syntax:
-   - `echo "your prompt here" | codex exec --skip-git-repo-check resume --last - 2>/dev/null`
+6. When continuing a previous session, look up the session ID from `.coord/sessions.jsonl` and use `resume <SESSION_ID>`. Follow the Resume Protocol (self-check prompt first). When resuming, don't use any configuration flags unless explicitly requested by the user (e.g., model or reasoning effort). Resume syntax:
+   - `echo "<resume prompt>" | codex exec --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null`
    - All flags have to be inserted between `exec` and `resume`.
-   - **Parallel mode**: prefer `resume <SESSION_ID>` over `resume --last` to avoid cross-worktree ambiguity.
+   - Fall back to `resume --last` only if no registry entry exists.
 7. **IMPORTANT**: By default, append `2>/dev/null` to all `codex exec` commands to suppress thinking tokens (stderr). Only show stderr if the user explicitly requests to see thinking tokens or if debugging is needed. **On non-zero exit**, re-run without `2>/dev/null` to capture error details before reporting.
 8. Run the command, capture stdout/stderr (filtered as appropriate), and summarize the outcome for the user.
-9. **After Codex completes**, inform the user: "You can resume this Codex session at any time by saying 'codex resume' or asking me to continue with additional analysis or changes."
+9. **After launching Codex**, extract the session ID and append a registry entry to `.coord/sessions.jsonl` (see Session Registry).
+10. **After Codex completes**, update the registry entry status to `done` and inform the user: "You can resume this Codex session at any time by saying 'codex resume' or asking me to continue with additional analysis or changes."
 
 ## Smart Sandbox Selection
 Choose the minimum required access. Prefer least privilege.
@@ -256,8 +330,9 @@ If a phase or ownership boundary is unclear, stop and request clarification.
 
 ## Following Up
 - If the task package is incomplete, request clarification **before** running Codex.
-- After every `codex` command, use `AskUserQuestion` to confirm next steps, collect clarifications, or decide whether to resume with `codex exec resume --last`.
+- After every `codex` command, update `.coord/sessions.jsonl` and use `AskUserQuestion` to confirm next steps, collect clarifications, or decide whether to resume with `codex exec resume <SESSION_ID>`.
 - Restate the chosen model, reasoning effort, and sandbox mode when proposing follow-up actions.
+- If conversation context has been lost, read `.coord/sessions.jsonl` to recover active session state before taking action.
 
 ## Error Handling
 - Stop and report failures whenever `codex --version` or a `codex exec` command exits non-zero; request direction before retrying.
@@ -265,3 +340,4 @@ If a phase or ownership boundary is unclear, stop and request clarification.
 - When output includes warnings or partial results, summarize them and ask how to adjust using `AskUserQuestion`.
 - If phase boundaries or role ownership are violated, stop and request clarification.
 - **Parallel mode**: if worktree creation fails, fall back to serial mode and inform the user.
+- **Timeout recovery**: if a `codex exec` command is interrupted by timeout, the session is still recoverable. Look up the session ID from `.coord/sessions.jsonl`, then resume using the Resume Protocol. On the first resume after a timeout, temporarily remove `2>/dev/null` to capture any diagnostic stderr.
