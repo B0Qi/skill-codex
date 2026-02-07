@@ -168,25 +168,36 @@ grep -qxF '.coord/' .git/info/exclude 2>/dev/null || echo '.coord/' >> .git/info
 
 ### Registry Entry Format
 
-Append one line per Codex session:
+Append one line per agent session:
 
 ```json
-{"session_id":"<ID>","task":"<short task description>","status":"running","cwd":"<working dir>","mode":"serial","created_at":"<ISO8601>"}
+{"agent":"codex","session_id":"<ID>","session_ref":{"type":"id","value":"<ID>"},"task":"<short task description>","status":"running","cwd":"<working dir>","mode":"serial","created_at":"<ISO8601>"}
 ```
 
 **Fields:**
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `session_id` | yes | Codex session ID (extract from output or `~/.codex/sessions/`) |
+| `agent` | yes | Agent that owns this session: `codex` or `gemini`. Defaults to `"codex"` if omitted (backward-compatible). |
+| `session_id` | yes | Unified session identifier (Codex session ID or a generated ID for Gemini) |
+| `session_ref` | yes | Agent-specific session reference for resume. See below. |
 | `task` | yes | One-line description of what this session is doing |
 | `status` | yes | `running`, `paused`, `done`, `failed` |
 | `cwd` | yes | Working directory (main project root or worktree path) |
 | `mode` | yes | `serial` or `parallel` |
 | `created_at` | yes | ISO 8601 timestamp |
-| `branch` | parallel only | Branch name (`cx/<task>`) |
+| `branch` | parallel only | Branch name (`cx/<task>` or `gm/<task>`) |
 | `updated_at` | no | Last status change timestamp |
 | `notes` | no | Free-form context (blockers, partial results, etc.) |
+
+**`session_ref` by agent:**
+
+| Agent | `session_ref.type` | `session_ref.value` | Notes |
+| --- | --- | --- | --- |
+| codex | `id` | Codex session ID string | Stable — can resume directly by ID |
+| gemini | `index` | Integer session index | **Volatile** — must re-resolve via `gemini --list-sessions` before resume, as indices shift |
+
+Entries without `agent` or `session_ref` are treated as legacy Codex entries (`agent: "codex"`, `session_ref` derived from `session_id`).
 
 ### Registry Lifecycle
 
@@ -209,8 +220,10 @@ find ~/.codex/sessions -name '*.jsonl' -newer .coord/sessions.jsonl -print0 2>/d
 
 When Claude Code loses context (conversation compression, new session, etc.):
 1. Read `.coord/sessions.jsonl` to find sessions with `status: running`.
-2. Read the original Task Package (if saved in `.coord/` or conversation).
-3. Resume the session with a status-check prompt (see Resume Protocol below).
+2. Filter by `agent` field — only act on entries matching the current skill context (e.g., `agent: "codex"` for this skill). Entries without an `agent` field default to `"codex"`.
+3. Read the original Task Package (if saved in `.coord/` or conversation).
+4. Use `session_ref` to construct the correct resume command for the agent type.
+5. Resume the session with a status-check prompt (see Resume Protocol below).
 
 ## Resume Protocol
 
@@ -225,10 +238,13 @@ When resuming a Codex session (whether after timeout, context loss, or user-init
    4. Any blockers or decisions needed
    Then continue with the remaining work.
    ```
-2. **Use explicit session ID**, not `--last`:
-   ```bash
-   echo "<resume prompt>" | codex exec --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null
-   ```
+2. **Use `session_ref` to construct the resume command.** Look up the registry entry and use `session_ref.type` to determine the correct command:
+   - **Codex** (`session_ref.type: "id"`): use the session ID directly:
+     ```bash
+     echo "<resume prompt>" | codex exec --skip-git-repo-check resume <session_ref.value> - 2>/dev/null
+     ```
+   - **Gemini** (`session_ref.type: "index"`): re-resolve the index first, then resume (see `/gemini` skill for details).
+   - **Fallback**: if `session_ref` is missing (legacy entry), use `session_id` as a Codex session ID.
 3. **After timeout or error**: temporarily remove `2>/dev/null` on the next resume to capture any diagnostic output, then re-add it once confirmed working.
 4. **Update the registry** after resume completes (status, updated_at, notes).
 
