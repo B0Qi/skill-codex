@@ -114,7 +114,7 @@ git merge --no-ff cx/<task>
 - Uses the shared **Session Registry** (`.coord/sessions.jsonl`). In parallel mode, each worktree's Codex session gets its own registry entry with `mode: parallel` and the worktree `cwd`.
 - Resume Codex in its worktree using the recorded session ID:
   ```bash
-  codex exec -C ../<project>-codex \
+  codex exec --json --yolo -C ../<project>-codex \
     --skip-git-repo-check resume <SESSION_ID> "<resume prompt>" 2>/dev/null
   ```
 
@@ -286,17 +286,17 @@ When resuming a Codex session (whether after timeout, context loss, or user-init
 2. **Use `session_ref` to construct the resume command.** Look up the registry entry and use `session_ref.type` to determine the correct command:
    - **Codex** (`session_ref.type: "id"`): use the session ID directly:
      ```bash
-     codex exec --skip-git-repo-check resume <session_ref.value> "<resume prompt>" 2>/dev/null
+     codex exec --json --yolo --skip-git-repo-check resume <session_ref.value> "<resume prompt>" 2>/dev/null
      ```
    - **Gemini** (`session_ref.type: "index"`): re-resolve the index first, then resume (see `/gemini` skill for details).
    - **Fallback**: if `session_ref` is missing (legacy entry), use `session_id` as a Codex session ID.
 3. **CWD matters for resume.** `codex exec resume` filters sessions by current working directory by default.
    - **Best practice**: `cd` to the `cwd` recorded in the registry entry before resuming.
-   - **Fallback**: use `--all` to bypass CWD filtering: `codex exec --skip-git-repo-check resume --all <SESSION_ID> "<prompt>" 2>/dev/null`
+   - **Fallback**: use `--all` to bypass CWD filtering: `codex exec --json --yolo --skip-git-repo-check resume --all <SESSION_ID> "<prompt>" 2>/dev/null`
    - **Note**: `codex exec resume` does NOT support `-C` — you must physically `cd` to the correct directory.
    - When outputting resume commands for the user, always include the `cd` prefix:
      ```bash
-     cd /path/to/original/cwd && codex exec --skip-git-repo-check resume <SESSION_ID> "<prompt>" 2>/dev/null
+     cd /path/to/original/cwd && codex exec --json --yolo --skip-git-repo-check resume <SESSION_ID> "<prompt>" 2>/dev/null
      ```
 4. **After timeout or error**: temporarily remove `2>/dev/null` on the next resume to capture any diagnostic output, then re-add it once confirmed working.
 5. **Update the registry** after resume completes (status, updated_at, notes).
@@ -354,11 +354,13 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
      ```
    - **NEVER use `-p` with multiline text** — Codex CLI may misparse it as a config profile name (especially if prompt starts with `[`).
    - **NEVER use trailing `-`** for stdin — it is not a valid positional argument for `codex exec`.
-7. When continuing a previous session, look up the session ID from `.coord/sessions.jsonl` and use `resume <SESSION_ID>`. Follow the Resume Protocol (self-check prompt first). When resuming, don't use any configuration flags unless explicitly requested by the user (e.g., model or reasoning effort). Resume syntax:
+7. When continuing a previous session, look up the session ID from `.coord/sessions.jsonl` and use `resume <SESSION_ID>`. Follow the Resume Protocol (self-check prompt first). Resume syntax:
    ```bash
-   codex exec --skip-git-repo-check resume <SESSION_ID> "Resume prompt here" 2>/dev/null
+   codex exec --json --yolo --skip-git-repo-check resume <SESSION_ID> "Resume prompt here" 2>/dev/null
    ```
-   - All flags have to be inserted between `exec` and `resume`.
+   - **`--json` and `--yolo` are REQUIRED on resume** — permissions and output mode do not carry over from the original session. Without `--yolo`, resume falls back to default sandbox mode.
+   - All flags must be inserted between `exec` and `resume`.
+   - Model/reasoning flags are not needed on resume (inherited from original session).
    - Fall back to `resume --last` only if no registry entry exists.
 8. **IMPORTANT — stderr handling**:
    - By default, append `2>/dev/null` to foreground `codex exec` commands to suppress thinking tokens (stderr). With `--json`, agent output goes to stdout as structured JSONL, so `2>/dev/null` is safe and recommended.
@@ -413,7 +415,7 @@ codex exec --skip-git-repo-check \
 | Reviewing untrusted PR or repo | Safe mode | `--sandbox workspace-write --full-auto -c sandbox_workspace_write.network_access=true` |
 | User explicitly asks for sandbox | Safe mode | (same as above) |
 | Parallel worktree | Full access | `--yolo -C /absolute/path/to/worktree` |
-| Resume session | Inherited | `resume <SESSION_ID>` |
+| Resume session | Full access | `--json --yolo ... resume <SESSION_ID>` (permissions NOT inherited) |
 
 ## Acceptance Workflow (Claude Code)
 After Codex execution, Claude Code should:
