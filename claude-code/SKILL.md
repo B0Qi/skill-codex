@@ -75,11 +75,14 @@ git switch cc/<task>
 mkdir -p .coord
 grep -qxF '.coord/' .git/info/exclude 2>/dev/null || echo '.coord/' >> .git/info/exclude
 
-# Launch Codex in its worktree
-codex exec -C ../<project>-codex --skip-git-repo-check \
-  -m gpt-5.3-codex --config model_reasoning_effort="high" \
-  --sandbox workspace-write --full-auto \
-  "<task package prompt>" 2>/dev/null
+# Launch Codex in its worktree (ALWAYS verify and use absolute path for -C)
+WORKTREE="$(cd ../<project>-codex && pwd)"
+test -d "$WORKTREE" || { echo "ERROR: worktree not found at $WORKTREE"; exit 1; }
+PROMPT="<task package prompt>"
+codex exec -C "$WORKTREE" --skip-git-repo-check \
+  -m gpt-5.3-codex -c model_reasoning_effort='"high"' \
+  --yolo \
+  "$PROMPT" 2>/dev/null
 ```
 
 #### Integration Commands
@@ -111,8 +114,8 @@ git merge --no-ff cx/<task>
 - Uses the shared **Session Registry** (`.coord/sessions.jsonl`). In parallel mode, each worktree's Codex session gets its own registry entry with `mode: parallel` and the worktree `cwd`.
 - Resume Codex in its worktree using the recorded session ID:
   ```bash
-  echo "<resume prompt>" | codex exec -C ../<project>-codex \
-    --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null
+  codex exec -C ../<project>-codex \
+    --skip-git-repo-check resume <SESSION_ID> "<resume prompt>" 2>/dev/null
   ```
 
 #### Coordination Protocol (`.coord/`)
@@ -208,13 +211,55 @@ Entries without `agent` or `session_ref` are treated as legacy Codex entries (`a
 
 ### Extracting Session ID
 
-From `~/.codex/sessions/`:
-```bash
-# Find the most recent session file and extract its ID
-find ~/.codex/sessions -name '*.jsonl' -newer .coord/sessions.jsonl -print0 2>/dev/null \
-  | xargs -0 ls -t | head -1 \
-  | xargs jq -r 'select(.type=="session_meta") | .payload.id'
+**Always use `--json` mode** to capture the session ID reliably. The `--json` flag outputs structured JSONL events to stdout, and the very first line is a `thread.started` event containing the session UUID:
+
+```json
+{"type":"thread.started","thread_id":"019c50f4-16ca-7711-afae-eecea2cb60a2"}
 ```
+
+**Extraction pattern (foreground):**
+```bash
+# Run with --json, capture full output
+OUTPUT=$(codex exec --json [OPTIONS] "$PROMPT" 2>/dev/null)
+
+# Extract session ID from the first line (thread.started event)
+SESSION_ID=$(echo "$OUTPUT" | head -1 | python3 -c "import sys,json; print(json.loads(sys.stdin.readline())['thread_id'])")
+
+# Extract the agent's response text
+RESPONSE=$(echo "$OUTPUT" | python3 -c "
+import sys,json
+for line in sys.stdin:
+    obj=json.loads(line)
+    if obj.get('type')=='item.completed':
+        print(obj['item']['text'])
+")
+```
+
+**Extraction pattern (background):**
+```bash
+# Background: capture both stdout and stderr
+codex exec --json [OPTIONS] "$PROMPT" 2>&1 | tee /tmp/codex_output.jsonl &
+# Poll for session ID:
+SESSION_ID=""
+for i in $(seq 1 60); do
+  SESSION_ID=$(head -1 /tmp/codex_output.jsonl 2>/dev/null | python3 -c "import sys,json; print(json.loads(sys.stdin.readline()).get('thread_id',''))" 2>/dev/null)
+  [ -n "$SESSION_ID" ] && break
+  sleep 0.5
+done
+```
+
+**Validation:** Session IDs must be UUID format (8-4-4-4-12 hex). Reject any value that doesn't match:
+```bash
+[[ "$SESSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || echo "ERROR: invalid session ID"
+```
+
+**Fallback (stderr grep):** If `--json` is unavailable, extract from stderr:
+```bash
+codex exec [OPTIONS] "$PROMPT" 2>/tmp/codex_stderr.txt
+SESSION_ID=$(grep "session id:" /tmp/codex_stderr.txt | awk '{print $NF}')
+```
+
+> **WARNING:** The old `find ~/.codex/sessions -newer ... | jq` method is **deprecated** — it is unreliable and has produced garbage values in production. Do not use it.
 
 ### Context Recovery
 
@@ -241,12 +286,20 @@ When resuming a Codex session (whether after timeout, context loss, or user-init
 2. **Use `session_ref` to construct the resume command.** Look up the registry entry and use `session_ref.type` to determine the correct command:
    - **Codex** (`session_ref.type: "id"`): use the session ID directly:
      ```bash
-     echo "<resume prompt>" | codex exec --skip-git-repo-check resume <session_ref.value> - 2>/dev/null
+     codex exec --skip-git-repo-check resume <session_ref.value> "<resume prompt>" 2>/dev/null
      ```
    - **Gemini** (`session_ref.type: "index"`): re-resolve the index first, then resume (see `/gemini` skill for details).
    - **Fallback**: if `session_ref` is missing (legacy entry), use `session_id` as a Codex session ID.
-3. **After timeout or error**: temporarily remove `2>/dev/null` on the next resume to capture any diagnostic output, then re-add it once confirmed working.
-4. **Update the registry** after resume completes (status, updated_at, notes).
+3. **CWD matters for resume.** `codex exec resume` filters sessions by current working directory by default.
+   - **Best practice**: `cd` to the `cwd` recorded in the registry entry before resuming.
+   - **Fallback**: use `--all` to bypass CWD filtering: `codex exec --skip-git-repo-check resume --all <SESSION_ID> "<prompt>" 2>/dev/null`
+   - **Note**: `codex exec resume` does NOT support `-C` — you must physically `cd` to the correct directory.
+   - When outputting resume commands for the user, always include the `cd` prefix:
+     ```bash
+     cd /path/to/original/cwd && codex exec --skip-git-repo-check resume <SESSION_ID> "<prompt>" 2>/dev/null
+     ```
+4. **After timeout or error**: temporarily remove `2>/dev/null` on the next resume to capture any diagnostic output, then re-add it once confirmed working.
+5. **Update the registry** after resume completes (status, updated_at, notes).
 
 ## Task Package Format (Standard Prompt Template)
 Codex must receive a normalized Task Package. If missing, ask Claude Code to supply it.
@@ -283,37 +336,84 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
 ## Running a Task
 1. Confirm the Task Package exists and is complete.
 2. Ask the user (via `AskUserQuestion`) which model to run (default: `gpt-5.3-codex`) AND which reasoning effort to use (`xhigh`, `high`, `medium`, or `low`) in a **single prompt with two questions**.
-3. Select the sandbox mode required for the task; default to `--sandbox read-only` unless edits or network access are necessary.
+3. Select the permissions mode (see **Permissions Model** section below). Default is `--yolo` (full access). Use safe mode only when the user explicitly requests it or the task involves an untrusted codebase.
 4. Assemble the command with the appropriate options:
+   - `--json` (REQUIRED — enables structured session ID extraction on stdout)
    - `-m, --model <MODEL>`
-   - `--config model_reasoning_effort="<xhigh|high|medium|low>"`
-   - `--sandbox <read-only|workspace-write|danger-full-access>`
-   - `--full-auto`
+   - `-c model_reasoning_effort='"<xhigh|high|medium|low>"'` (note: value must be TOML — wrap strings in single-quote + double-quote)
+   - `--yolo` (default) or `--sandbox workspace-write --full-auto -c sandbox_workspace_write.network_access=true` (safe mode)
    - `-C, --cd <DIR>` (use worktree path for parallel mode)
    - `--skip-git-repo-check`
 5. Always use `--skip-git-repo-check`.
-6. When continuing a previous session, look up the session ID from `.coord/sessions.jsonl` and use `resume <SESSION_ID>`. Follow the Resume Protocol (self-check prompt first). When resuming, don't use any configuration flags unless explicitly requested by the user (e.g., model or reasoning effort). Resume syntax:
-   - `echo "<resume prompt>" | codex exec --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null`
+6. **Prompt passing strategy** (IMPORTANT — `-p` flag is unreliable for multiline prompts):
+   - **Short prompts** (single line, no special chars): pass directly as positional argument: `codex exec [OPTIONS] "prompt text"`
+   - **Long/multiline prompts** (Task Packages): write the prompt to a temp file, then pass via shell variable:
+     ```bash
+     PROMPT=$(cat /path/to/prompt_file.txt)
+     codex exec [OPTIONS] "$PROMPT" 2>/dev/null
+     ```
+   - **NEVER use `-p` with multiline text** — Codex CLI may misparse it as a config profile name (especially if prompt starts with `[`).
+   - **NEVER use trailing `-`** for stdin — it is not a valid positional argument for `codex exec`.
+7. When continuing a previous session, look up the session ID from `.coord/sessions.jsonl` and use `resume <SESSION_ID>`. Follow the Resume Protocol (self-check prompt first). When resuming, don't use any configuration flags unless explicitly requested by the user (e.g., model or reasoning effort). Resume syntax:
+   ```bash
+   codex exec --skip-git-repo-check resume <SESSION_ID> "Resume prompt here" 2>/dev/null
+   ```
    - All flags have to be inserted between `exec` and `resume`.
    - Fall back to `resume --last` only if no registry entry exists.
-7. **IMPORTANT**: By default, append `2>/dev/null` to all `codex exec` commands to suppress thinking tokens (stderr). Only show stderr if the user explicitly requests to see thinking tokens or if debugging is needed. **On non-zero exit**, re-run without `2>/dev/null` to capture error details before reporting.
-8. Run the command, capture stdout/stderr (filtered as appropriate), and summarize the outcome for the user.
-9. **After launching Codex**, extract the session ID and append a registry entry to `.coord/sessions.jsonl` (see Session Registry).
-10. **After Codex completes**, update the registry entry status to `done` and inform the user: "You can resume this Codex session at any time by saying 'codex resume' or asking me to continue with additional analysis or changes."
+8. **IMPORTANT — stderr handling**:
+   - By default, append `2>/dev/null` to foreground `codex exec` commands to suppress thinking tokens (stderr). With `--json`, agent output goes to stdout as structured JSONL, so `2>/dev/null` is safe and recommended.
+   - **NEVER use `2>/dev/null` when running Codex in the background** (`run_in_background: true`). Background tasks cannot retry on failure, so stderr MUST be captured. Use `2>&1` instead so errors appear in the output file.
+   - **On non-zero exit** of foreground commands, re-run without `2>/dev/null` to capture error details before reporting.
+9. **IMPORTANT — path validation for `-C` flag**:
+   - Always use **absolute paths** with `-C`, never relative paths like `../<project>-codex`.
+   - Before launching Codex, **verify the `-C` path exists**: `ls -d /path/to/worktree` or `test -d /path/to/worktree`.
+   - Common mistake: nested project structures (e.g., `casimir2/casimir/`) cause `../project-codex` to resolve to wrong level.
+10. Run the command, capture stdout/stderr (filtered as appropriate), and summarize the outcome for the user.
+11. **After launching Codex**, extract the session ID from the `--json` output (see Extracting Session ID) and append a registry entry to `.coord/sessions.jsonl` (see Session Registry). **Validate** the ID is UUID format before recording.
+12. **After Codex completes**, update the registry entry status to `done` and inform the user: "You can resume this Codex session at any time by saying 'codex resume' or asking me to continue with additional analysis or changes."
 
-## Smart Sandbox Selection
-Choose the minimum required access. Prefer least privilege.
+## Permissions Model
 
-| Use case | Sandbox mode | Key flags |
+Codex uses a **2-tier permissions model** to match Claude Code's own access level and avoid sandbox-related failures in multi-agent workflows.
+
+### Default: Full Access (`--yolo`)
+
+Always use `--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`) unless the user explicitly requests safe mode. This flag:
+- Disables the OS-level sandbox (Landlock+seccomp on Linux, Seatbelt on macOS)
+- Skips all approval prompts
+- Grants full filesystem, network, and process access — matching Claude Code's own permissions
+
+**Rationale:** Claude Code already runs unsandboxed. Sandboxing only Codex creates a false security boundary while introducing complexity and failure modes (blocked sockets, write denials, network timeouts) that compound in multi-agent workflows.
+
+```bash
+# Standard command pattern (default)
+codex exec --yolo --skip-git-repo-check \
+  -m gpt-5.3-codex -c model_reasoning_effort='"high"' \
+  "$PROMPT" 2>/dev/null
+```
+
+### Safe Mode: Sandboxed with Network (opt-in)
+
+Use when working with **untrusted codebases** or when the user explicitly requests sandboxing. This mode restricts filesystem writes to the workspace while still allowing network access:
+
+```bash
+# Safe mode command pattern
+codex exec --skip-git-repo-check \
+  --sandbox workspace-write --full-auto \
+  -c sandbox_workspace_write.network_access=true \
+  -m gpt-5.3-codex -c model_reasoning_effort='"high"' \
+  "$PROMPT" 2>/dev/null
+```
+
+### When to Use Each Mode
+
+| Scenario | Mode | Flag |
 | --- | --- | --- |
-| Read-only review or analysis | `read-only` | `--sandbox read-only 2>/dev/null` |
-| Apply local edits | `workspace-write` | `--sandbox workspace-write --full-auto 2>/dev/null` |
-| Permit network or broad access | `danger-full-access` | `--sandbox danger-full-access 2>/dev/null` |
-| Resume recent session | Inherited from original | `echo "prompt" \| codex exec --skip-git-repo-check resume --last 2>/dev/null` |
-| Run from another directory | Match task needs | `-C <DIR>` plus other flags `2>/dev/null` |
-| Parallel worktree | `workspace-write` | `-C ../<project>-codex --sandbox workspace-write --full-auto 2>/dev/null` |
-
-If unsure, default to `read-only` and ask if writes/network are needed.
+| Own codebase, local dev (default) | Full access | `--yolo` |
+| Reviewing untrusted PR or repo | Safe mode | `--sandbox workspace-write --full-auto -c sandbox_workspace_write.network_access=true` |
+| User explicitly asks for sandbox | Safe mode | (same as above) |
+| Parallel worktree | Full access | `--yolo -C /absolute/path/to/worktree` |
+| Resume session | Inherited | `resume <SESSION_ID>` |
 
 ## Acceptance Workflow (Claude Code)
 After Codex execution, Claude Code should:
@@ -347,12 +447,12 @@ If a phase or ownership boundary is unclear, stop and request clarification.
 ## Following Up
 - If the task package is incomplete, request clarification **before** running Codex.
 - After every `codex` command, update `.coord/sessions.jsonl` and use `AskUserQuestion` to confirm next steps, collect clarifications, or decide whether to resume with `codex exec resume <SESSION_ID>`.
-- Restate the chosen model, reasoning effort, and sandbox mode when proposing follow-up actions.
+- Restate the chosen model and reasoning effort when proposing follow-up actions.
 - If conversation context has been lost, read `.coord/sessions.jsonl` to recover active session state before taking action.
 
 ## Error Handling
 - Stop and report failures whenever `codex --version` or a `codex exec` command exits non-zero; request direction before retrying.
-- Before you use high-impact flags (`--full-auto`, `--sandbox danger-full-access`, `--skip-git-repo-check`) ask the user for permission using AskUserQuestion unless it was already given.
+- The `--yolo` flag is the default for this skill and does not require additional user confirmation. If the user switches to safe mode, confirm before reverting to `--yolo`.
 - When output includes warnings or partial results, summarize them and ask how to adjust using `AskUserQuestion`.
 - If phase boundaries or role ownership are violated, stop and request clarification.
 - **Parallel mode**: if worktree creation fails, fall back to serial mode and inform the user.
