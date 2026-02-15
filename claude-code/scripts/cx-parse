@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""cx-parse — extract session ID and response from Codex JSONL output.
+
+Subcommands:
+  session-id   Extract thread_id from first line (O(1) read)
+  response     Extract last agent_message response text
+  extract      JSON output with session_id + text + metadata
+
+Exit codes: 0=ok, 2=not-found/invalid, 3=parse-error
+"""
+
+import argparse
+import json
+import re
+import sys
+from contextlib import contextmanager
+
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+EXIT_OK = 0
+EXIT_NOT_FOUND = 2
+EXIT_PARSE_ERROR = 3
+
+
+@contextmanager
+def open_input(path):
+    """Yield a readable file object. stdin when path is None or '-'."""
+    if path is None or path == "-":
+        yield sys.stdin
+    else:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+        try:
+            yield f
+        finally:
+            f.close()
+
+
+# ── session-id ───────────────────────────────────────────────────────
+
+def cmd_session_id(args):
+    """Read only the first line and extract thread_id."""
+    try:
+        with open_input(args.file) as f:
+            line = f.readline()
+            if not line.strip():
+                return EXIT_NOT_FOUND
+            obj = json.loads(line)
+            tid = obj.get("thread_id", "")
+            if not tid or not UUID_RE.match(tid):
+                return EXIT_NOT_FOUND
+            print(tid)
+            return EXIT_OK
+    except json.JSONDecodeError:
+        return EXIT_PARSE_ERROR
+    except OSError:
+        return EXIT_PARSE_ERROR
+
+
+# ── response ─────────────────────────────────────────────────────────
+
+def cmd_response(args):
+    """Stream line-by-line, keep only the last agent_message text."""
+    last = ""
+    source_path = args.file or "<stdin>"
+    try:
+        with open_input(args.file) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "item.completed":
+                    continue
+                item = obj.get("item") or {}
+                if item.get("type") != "agent_message":
+                    continue
+                text = item.get("text") or ""
+                if text:
+                    last = text
+    except OSError:
+        return EXIT_PARSE_ERROR
+
+    if not last:
+        return EXIT_NOT_FOUND
+
+    cap = args.max_chars
+    if cap and len(last) > cap:
+        print(
+            last[:cap]
+            + f"\n[truncated {len(last) - cap} chars"
+            + f" — full response in {source_path}]"
+        )
+    else:
+        print(last)
+    return EXIT_OK
+
+
+# ── extract ──────────────────────────────────────────────────────────
+
+def cmd_extract(args):
+    """Single-pass extraction: session_id + response as JSON."""
+    source_path = args.file
+
+    # --tee: consume stdin → save to file → parse the saved file
+    if args.tee:
+        if args.file is not None:
+            print(
+                "error: --tee and FILE are mutually exclusive",
+                file=sys.stderr,
+            )
+            return EXIT_PARSE_ERROR
+        source_path = args.tee
+        try:
+            with open(args.tee, "w", encoding="utf-8") as out:
+                for chunk in iter(lambda: sys.stdin.read(8192), ""):
+                    out.write(chunk)
+        except OSError as e:
+            print(f"error: cannot write to {args.tee}: {e}", file=sys.stderr)
+            return EXIT_PARSE_ERROR
+        args.file = args.tee
+
+    session_id = ""
+    last = ""
+    first_line = True
+
+    try:
+        with open_input(args.file) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    first_line = False
+                    continue
+                if first_line:
+                    first_line = False
+                    tid = obj.get("thread_id", "")
+                    if tid and UUID_RE.match(tid):
+                        session_id = tid
+                if obj.get("type") != "item.completed":
+                    continue
+                item = obj.get("item") or {}
+                if item.get("type") != "agent_message":
+                    continue
+                text = item.get("text") or ""
+                if text:
+                    last = text
+    except OSError:
+        return EXIT_PARSE_ERROR
+
+    truncated = False
+    cap = args.max_chars
+    if cap and len(last) > cap:
+        last = last[:cap]
+        truncated = True
+
+    result = {
+        "session_id": session_id,
+        "text": last,
+        "text_truncated": truncated,
+    }
+    if source_path:
+        result["metadata"] = {"source": source_path}
+
+    print(json.dumps(result))
+    return EXIT_OK if (session_id or last) else EXIT_NOT_FOUND
+
+
+# ── CLI ──────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="cx-parse",
+        description="Extract session ID and response from Codex JSONL output.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # session-id
+    p_sid = sub.add_parser(
+        "session-id", help="Extract session ID (first line only)"
+    )
+    p_sid.add_argument(
+        "file", nargs="?", default=None, help="JSONL file (default: stdin)"
+    )
+
+    # response
+    p_resp = sub.add_parser(
+        "response", help="Extract last agent response"
+    )
+    p_resp.add_argument(
+        "file", nargs="?", default=None, help="JSONL file (default: stdin)"
+    )
+    p_resp.add_argument(
+        "--max-chars",
+        type=int,
+        default=None,
+        help="Truncate response to N chars",
+    )
+
+    # extract
+    p_ext = sub.add_parser(
+        "extract", help="Extract session_id + response as JSON"
+    )
+    p_ext.add_argument(
+        "file", nargs="?", default=None, help="JSONL file (default: stdin)"
+    )
+    p_ext.add_argument(
+        "--max-chars",
+        type=int,
+        default=None,
+        help="Truncate response to N chars",
+    )
+    p_ext.add_argument(
+        "--tee",
+        metavar="PATH",
+        default=None,
+        help="Save stdin to PATH, then parse the saved file",
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "session-id":
+        sys.exit(cmd_session_id(args))
+    elif args.command == "response":
+        sys.exit(cmd_response(args))
+    elif args.command == "extract":
+        sys.exit(cmd_extract(args))
+
+
+if __name__ == "__main__":
+    main()

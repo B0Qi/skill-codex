@@ -79,10 +79,11 @@ grep -qxF '.coord/' .git/info/exclude 2>/dev/null || echo '.coord/' >> .git/info
 WORKTREE="$(cd ../<project>-codex && pwd)"
 test -d "$WORKTREE" || { echo "ERROR: worktree not found at $WORKTREE"; exit 1; }
 PROMPT="<task package prompt>"
-codex exec -C "$WORKTREE" --skip-git-repo-check \
+codex exec --json -C "$WORKTREE" --skip-git-repo-check \
   -m gpt-5.3-codex -c model_reasoning_effort='"high"' \
   --yolo \
-  "$PROMPT" 2>/dev/null
+  "$PROMPT" >"$JSONL" 2>/dev/null
+# Extract SESSION_ID and RESPONSE using the patterns in "Extracting Session ID & Response"
 ```
 
 #### Integration Commands
@@ -112,10 +113,10 @@ git merge --no-ff cx/<task>
 
 #### Worktree Session Management
 - Uses the shared **Session Registry** (`.coord/sessions.jsonl`). In parallel mode, each worktree's Codex session gets its own registry entry with `mode: parallel` and the worktree `cwd`.
-- Resume Codex in its worktree using the recorded session ID:
+- Resume Codex in its worktree using the recorded session ID. Use the temp-file extraction pattern (see "Extracting Session ID & Response"):
   ```bash
   codex exec --json --yolo -C ../<project>-codex \
-    --skip-git-repo-check resume <SESSION_ID> "<resume prompt>" 2>/dev/null
+    --skip-git-repo-check resume <SESSION_ID> "<resume prompt>" >"$JSONL" 2>/dev/null
   ```
 
 #### Coordination Protocol (`.coord/`)
@@ -219,46 +220,29 @@ Entries without `agent` or `session_ref` are treated as legacy Codex entries (`a
 
 > **IMPORTANT — Context-window protection:** The `--json` JSONL stream contains ALL intermediate events (file reads, tool calls, command outputs) and can easily reach **50-100KB+** for multi-file tasks. **NEVER capture the full stream into a shell variable** (`OUTPUT=$(codex exec ...)`). Always redirect to a temp file and extract only the two fields you need: `thread_id` and the final `item.completed` response text.
 
+**Parser shorthand** (available after `install.sh`):
+```bash
+CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+```
+
+`cx-parse` is a zero-dependency Python 3 CLI that extracts `session_id` and `response` from Codex JSONL without loading the full stream into memory. Exit codes: 0=ok, 2=not-found/invalid, 3=parse-error. UUID validation is built in.
+
 **Extraction pattern (foreground):**
 ```bash
+CX="$HOME/.claude/skills/codex/scripts/cx-parse"
 JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
-TEXT_CAP=12288  # 12KB cap on response text entering context
 
 # Redirect JSONL to file — nothing enters Claude Code's context yet
 codex exec --json [OPTIONS] "$PROMPT" >"$JSONL" 2>/dev/null
 
-# Extract session ID (first line only)
-SESSION_ID="$(python3 - "$JSONL" <<'PY'
-import json,sys
-with open(sys.argv[1],'r',encoding='utf-8',errors='replace') as f:
-    obj=json.loads(f.readline())
-print(obj.get('thread_id',''))
-PY
-)"
-
-# Extract the last agent response, capped to TEXT_CAP chars
-RESPONSE="$(python3 - "$JSONL" "$TEXT_CAP" <<'PY'
-import json,sys
-path,cap=sys.argv[1],int(sys.argv[2])
-last=""
-with open(path,'r',encoding='utf-8',errors='replace') as f:
-    for line in f:
-        try: obj=json.loads(line)
-        except Exception: continue
-        if obj.get('type')=='item.completed':
-            last=(obj.get('item') or {}).get('text') or ""
-if len(last)>cap:
-    print(last[:cap]+f"\n[truncated {len(last)-cap} chars — full response in {path}]")
-else:
-    print(last)
-PY
-)"
+SESSION_ID="$($CX session-id "$JSONL")"
+RESPONSE="$($CX response "$JSONL" --max-chars 12288)"
 # $JSONL remains on disk for diagnostics; clean up when no longer needed
 ```
 
 **Extraction pattern (background):**
 ```bash
-# Background: separate stdout (JSONL) from stderr (thinking tokens / errors)
+CX="$HOME/.claude/skills/codex/scripts/cx-parse"
 JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 ERR="$(mktemp -t codex.XXXXXX.err)"
 
@@ -268,19 +252,7 @@ CODEX_PID=$!
 # Poll for session ID (reads only the first line, not the whole file)
 SESSION_ID=""
 for i in $(seq 1 120); do
-  if [ -s "$JSONL" ]; then
-    SESSION_ID="$(python3 - "$JSONL" <<'PY'
-import json,sys
-try:
-    with open(sys.argv[1],'r',encoding='utf-8',errors='replace') as f:
-        obj=json.loads(f.readline())
-    print(obj.get('thread_id',''))
-except Exception:
-    print("")
-PY
-)"
-    [ -n "$SESSION_ID" ] && break
-  fi
+  [ -s "$JSONL" ] && SESSION_ID="$($CX session-id "$JSONL" 2>/dev/null)" && [ -n "$SESSION_ID" ] && break
   sleep 0.5
 done
 
@@ -288,12 +260,41 @@ done
 #   tail -n 5 "$ERR"              # last few stderr lines for diagnostics
 #   wc -l < "$JSONL"              # event count as progress indicator
 
-# After completion, extract response with same capped pattern as foreground
+# After completion, extract response:
+RESPONSE="$($CX response "$JSONL" --max-chars 12288)"
 ```
 
-**Validation:** Session IDs must be UUID format (8-4-4-4-12 hex). Reject any value that doesn't match:
+**JSON extraction** (session_id + text + metadata in one call):
 ```bash
-[[ "$SESSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || echo "ERROR: invalid session ID"
+$CX extract "$JSONL" --max-chars 12288
+# stdout: {"session_id":"...","text":"...","text_truncated":false,"metadata":{"source":"..."}}
+```
+
+**Pipe mode with `--tee`** (save stdin copy then parse):
+```bash
+codex exec --json [OPTIONS] "$PROMPT" 2>/dev/null | $CX extract --tee "$JSONL" --max-chars 12288
+```
+
+**Fallback (inline):** If `cx-parse` is unavailable, use inline Python:
+```bash
+SESSION_ID="$(python3 -c "
+import json,sys
+with open(sys.argv[1],'r',errors='replace') as f: obj=json.loads(f.readline())
+print(obj.get('thread_id',''))
+" "$JSONL")"
+
+RESPONSE="$(python3 -c "
+import json,sys; path,cap=sys.argv[1],int(sys.argv[2]); last=''
+with open(path,'r',errors='replace') as f:
+    for line in f:
+        try: obj=json.loads(line)
+        except: continue
+        if obj.get('type')=='item.completed':
+            item=obj.get('item') or {}
+            if item.get('type')=='agent_message': last=item.get('text') or ''
+if len(last)>cap: print(last[:cap]+f'\n[truncated {len(last)-cap} chars]')
+else: print(last)
+" "$JSONL" 12288)"
 ```
 
 **Fallback (stderr grep):** If `--json` is unavailable, extract from stderr:
@@ -431,7 +432,7 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
    - Before launching Codex, **verify the `-C` path exists**: `ls -d /path/to/worktree` or `test -d /path/to/worktree`.
    - Common mistake: nested project structures (e.g., `casimir2/casimir/`) cause `../project-codex` to resolve to wrong level.
 10. Run the command using the **Extraction patterns** from the "Extracting Session ID & Response" section. **NEVER capture raw JSONL into a shell variable** — always redirect to a temp file and extract only `SESSION_ID` + capped `RESPONSE`. Summarize the outcome for the user.
-11. **After launching Codex**, extract the session ID from the `--json` output (see Extracting Session ID) and append a registry entry to `.coord/sessions.jsonl` (see Session Registry). **Validate** the ID is UUID format before recording.
+11. **After launching Codex**, extract the session ID from the temp file (see "Extracting Session ID & Response") and append a registry entry to `.coord/sessions.jsonl` (see Session Registry). **Validate** the ID is UUID format before recording.
 12. **After Codex completes**, update the registry entry status to `done` and inform the user: "You can resume this Codex session at any time by saying 'codex resume' or asking me to continue with additional analysis or changes."
 
 ## Permissions Model
