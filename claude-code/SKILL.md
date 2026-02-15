@@ -209,7 +209,7 @@ Entries without `agent` or `session_ref` are treated as legacy Codex entries (`a
 3. **On timeout/interrupt**: status stays `running` — on next interaction, Claude Code reads the registry, finds the active session, and resumes it.
 4. **On failure**: update status to `failed`, add error details to `notes`.
 
-### Extracting Session ID
+### Extracting Session ID & Response
 
 **Always use `--json` mode** to capture the session ID reliably. The `--json` flag outputs structured JSONL events to stdout, and the very first line is a `thread.started` event containing the session UUID:
 
@@ -217,35 +217,78 @@ Entries without `agent` or `session_ref` are treated as legacy Codex entries (`a
 {"type":"thread.started","thread_id":"019c50f4-16ca-7711-afae-eecea2cb60a2"}
 ```
 
+> **IMPORTANT — Context-window protection:** The `--json` JSONL stream contains ALL intermediate events (file reads, tool calls, command outputs) and can easily reach **50-100KB+** for multi-file tasks. **NEVER capture the full stream into a shell variable** (`OUTPUT=$(codex exec ...)`). Always redirect to a temp file and extract only the two fields you need: `thread_id` and the final `item.completed` response text.
+
 **Extraction pattern (foreground):**
 ```bash
-# Run with --json, capture full output
-OUTPUT=$(codex exec --json [OPTIONS] "$PROMPT" 2>/dev/null)
+JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
+TEXT_CAP=12288  # 12KB cap on response text entering context
 
-# Extract session ID from the first line (thread.started event)
-SESSION_ID=$(echo "$OUTPUT" | head -1 | python3 -c "import sys,json; print(json.loads(sys.stdin.readline())['thread_id'])")
+# Redirect JSONL to file — nothing enters Claude Code's context yet
+codex exec --json [OPTIONS] "$PROMPT" >"$JSONL" 2>/dev/null
 
-# Extract the agent's response text
-RESPONSE=$(echo "$OUTPUT" | python3 -c "
-import sys,json
-for line in sys.stdin:
-    obj=json.loads(line)
-    if obj.get('type')=='item.completed':
-        print(obj['item']['text'])
-")
+# Extract session ID (first line only)
+SESSION_ID="$(python3 - "$JSONL" <<'PY'
+import json,sys
+with open(sys.argv[1],'r',encoding='utf-8',errors='replace') as f:
+    obj=json.loads(f.readline())
+print(obj.get('thread_id',''))
+PY
+)"
+
+# Extract the last agent response, capped to TEXT_CAP chars
+RESPONSE="$(python3 - "$JSONL" "$TEXT_CAP" <<'PY'
+import json,sys
+path,cap=sys.argv[1],int(sys.argv[2])
+last=""
+with open(path,'r',encoding='utf-8',errors='replace') as f:
+    for line in f:
+        try: obj=json.loads(line)
+        except Exception: continue
+        if obj.get('type')=='item.completed':
+            last=(obj.get('item') or {}).get('text') or ""
+if len(last)>cap:
+    print(last[:cap]+f"\n[truncated {len(last)-cap} chars — full response in {path}]")
+else:
+    print(last)
+PY
+)"
+# $JSONL remains on disk for diagnostics; clean up when no longer needed
 ```
 
 **Extraction pattern (background):**
 ```bash
-# Background: capture both stdout and stderr
-codex exec --json [OPTIONS] "$PROMPT" 2>&1 | tee /tmp/codex_output.jsonl &
-# Poll for session ID:
+# Background: separate stdout (JSONL) from stderr (thinking tokens / errors)
+JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
+ERR="$(mktemp -t codex.XXXXXX.err)"
+
+codex exec --json [OPTIONS] "$PROMPT" >"$JSONL" 2>"$ERR" &
+CODEX_PID=$!
+
+# Poll for session ID (reads only the first line, not the whole file)
 SESSION_ID=""
-for i in $(seq 1 60); do
-  SESSION_ID=$(head -1 /tmp/codex_output.jsonl 2>/dev/null | python3 -c "import sys,json; print(json.loads(sys.stdin.readline()).get('thread_id',''))" 2>/dev/null)
-  [ -n "$SESSION_ID" ] && break
+for i in $(seq 1 120); do
+  if [ -s "$JSONL" ]; then
+    SESSION_ID="$(python3 - "$JSONL" <<'PY'
+import json,sys
+try:
+    with open(sys.argv[1],'r',encoding='utf-8',errors='replace') as f:
+        obj=json.loads(f.readline())
+    print(obj.get('thread_id',''))
+except Exception:
+    print("")
+PY
+)"
+    [ -n "$SESSION_ID" ] && break
+  fi
   sleep 0.5
 done
+
+# When checking status: NEVER read the full JSONL. Use targeted extraction:
+#   tail -n 5 "$ERR"              # last few stderr lines for diagnostics
+#   wc -l < "$JSONL"              # event count as progress indicator
+
+# After completion, extract response with same capped pattern as foreground
 ```
 
 **Validation:** Session IDs must be UUID format (8-4-4-4-12 hex). Reject any value that doesn't match:
@@ -264,11 +307,13 @@ SESSION_ID=$(grep "session id:" /tmp/codex_stderr.txt | awk '{print $NF}')
 ### Context Recovery
 
 When Claude Code loses context (conversation compression, new session, etc.):
-1. Read `.coord/sessions.jsonl` to find sessions with `status: running`.
+1. Read `.coord/sessions.jsonl` to find sessions with `status: running`. **Use `tail -n 50`** — never read the entire file, as it is append-only and grows over time.
 2. Filter by `agent` field — only act on entries matching the current skill context (e.g., `agent: "codex"` for this skill). Entries without an `agent` field default to `"codex"`.
 3. Read the original Task Package (if saved in `.coord/` or conversation).
 4. Use `session_ref` to construct the correct resume command for the agent type.
 5. Resume the session with a status-check prompt (see Resume Protocol below).
+
+> **Append-only log hygiene:** `.coord/sessions.jsonl` and `.coord/events.jsonl` are append-only and can grow indefinitely. Always use `tail -n N` or filter by status/timestamp when reading them. Never `cat` the entire file into context.
 
 ## Resume Protocol
 
@@ -300,6 +345,10 @@ When resuming a Codex session (whether after timeout, context loss, or user-init
      ```
 4. **After timeout or error**: temporarily remove `2>/dev/null` on the next resume to capture any diagnostic output, then re-add it once confirmed working.
 5. **Update the registry** after resume completes (status, updated_at, notes).
+6. **Resume count tracking.** Each resume adds context to the conversation. To prevent cumulative context bloat:
+   - Track resume count in the registry entry's `notes` field (e.g., `"notes":"resume #3"`).
+   - After **3 resumes** of the same session, perform a "checkpoint": summarize all prior work into a short bullet list and save it to `.coord/<session_id>-summary.md`. On the next resume, use only this summary as context instead of carrying forward raw outputs.
+   - After **5 resumes**, recommend the user start a fresh session with a new Task Package that incorporates completed work.
 
 ## Task Package Format (Standard Prompt Template)
 Codex must receive a normalized Task Package. If missing, ask Claude Code to supply it.
@@ -375,13 +424,13 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
    - Fall back to `resume --last` only if no registry entry exists.
 8. **IMPORTANT — stderr handling**:
    - By default, append `2>/dev/null` to foreground `codex exec` commands to suppress thinking tokens (stderr). With `--json`, agent output goes to stdout as structured JSONL, so `2>/dev/null` is safe and recommended.
-   - **NEVER use `2>/dev/null` when running Codex in the background** (`run_in_background: true`). Background tasks cannot retry on failure, so stderr MUST be captured. Use `2>&1` instead so errors appear in the output file.
+   - **In background mode**, redirect stdout and stderr to **separate files** (`>"$JSONL" 2>"$ERR"`). Do NOT mix them with `2>&1` — mixing corrupts the JSONL stream and inflates the output with thinking tokens. See **Extraction pattern (background)** for the correct pattern.
    - **On non-zero exit** of foreground commands, re-run without `2>/dev/null` to capture error details before reporting.
 9. **IMPORTANT — path validation for `-C` flag**:
    - Always use **absolute paths** with `-C`, never relative paths like `../<project>-codex`.
    - Before launching Codex, **verify the `-C` path exists**: `ls -d /path/to/worktree` or `test -d /path/to/worktree`.
    - Common mistake: nested project structures (e.g., `casimir2/casimir/`) cause `../project-codex` to resolve to wrong level.
-10. Run the command, capture stdout/stderr (filtered as appropriate), and summarize the outcome for the user.
+10. Run the command using the **Extraction patterns** from the "Extracting Session ID & Response" section. **NEVER capture raw JSONL into a shell variable** — always redirect to a temp file and extract only `SESSION_ID` + capped `RESPONSE`. Summarize the outcome for the user.
 11. **After launching Codex**, extract the session ID from the `--json` output (see Extracting Session ID) and append a registry entry to `.coord/sessions.jsonl` (see Session Registry). **Validate** the ID is UUID format before recording.
 12. **After Codex completes**, update the registry entry status to `done` and inform the user: "You can resume this Codex session at any time by saying 'codex resume' or asking me to continue with additional analysis or changes."
 
@@ -431,10 +480,14 @@ codex exec --skip-git-repo-check \
 ## Acceptance Workflow (Claude Code)
 After Codex execution, Claude Code should:
 
-1. Perform diff review of modified files.
+1. **Size-aware diff review.** Use a tiered strategy to prevent large diffs from flooding the context window:
+   - Always start with `git diff --stat` and `git diff --name-only` for an overview.
+   - **≤10 files changed**: review full diffs with `git diff --unified=3 -- <file>` per file.
+   - **>10 files changed**: review only `--stat` + `--name-only`. For spot-checks, pick 3-5 representative files and show their diffs individually (limit to first 200 lines each with `| head -200`).
+   - **Always exclude generated/lock files** from full diff: `git diff -- ':!package-lock.json' ':!pnpm-lock.yaml' ':!*.lock'`
 2. Run tests or checks listed in `Acceptance Criteria`.
 3. Verify constraints and confirm no files outside the `Ownership` / `Files` boundary were modified.
-4. For parallel mode: check `.coord/events.jsonl` for blockers or handoff requests.
+4. For parallel mode: check `.coord/events.jsonl` (**use `tail -n 50`**, not full read) for blockers or handoff requests.
 5. Decide one of:
    - **Accept** — proceed to next task or commit (or integration for parallel mode)
    - **Revise** — re-enter Execute phase with feedback
