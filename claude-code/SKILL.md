@@ -78,12 +78,15 @@ grep -qxF '.coord/' .git/info/exclude 2>/dev/null || echo '.coord/' >> .git/info
 # Launch Codex in its worktree (ALWAYS verify and use absolute path for -C)
 WORKTREE="$(cd ../<project>-codex && pwd)"
 test -d "$WORKTREE" || { echo "ERROR: worktree not found at $WORKTREE"; exit 1; }
+CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 PROMPT="<task package prompt>"
 codex exec --json -C "$WORKTREE" --skip-git-repo-check \
   -m gpt-5.3-codex -c model_reasoning_effort='"high"' \
   --yolo \
   "$PROMPT" >"$JSONL" 2>/dev/null
-# Extract SESSION_ID and RESPONSE using the patterns in "Extracting Session ID & Response"
+SESSION_ID="$($CX session-id "$JSONL")"
+RESPONSE="$($CX response "$JSONL" --max-chars 12288)"
 ```
 
 #### Integration Commands
@@ -113,10 +116,15 @@ git merge --no-ff cx/<task>
 
 #### Worktree Session Management
 - Uses the shared **Session Registry** (`.coord/sessions.jsonl`). In parallel mode, each worktree's Codex session gets its own registry entry with `mode: parallel` and the worktree `cwd`.
-- Resume Codex in its worktree using the recorded session ID. Use the temp-file extraction pattern (see "Extracting Session ID & Response"):
+- Resume Codex in its worktree using the recorded session ID. Note: `resume` does NOT support `-C` — you must `cd` to the worktree first:
   ```bash
-  codex exec --json --yolo -C ../<project>-codex \
+  CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+  JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
+  WORKTREE="$(cd ../<project>-codex && pwd)"
+  cd "$WORKTREE" && codex exec --json --yolo \
     --skip-git-repo-check resume <SESSION_ID> "<resume prompt>" >"$JSONL" 2>/dev/null
+  SESSION_ID="$($CX session-id "$JSONL")"
+  RESPONSE="$($CX response "$JSONL" --max-chars 12288)"
   ```
 
 #### Coordination Protocol (`.coord/`)
