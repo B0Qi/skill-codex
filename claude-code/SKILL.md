@@ -82,7 +82,7 @@ CX="$HOME/.claude/skills/codex/scripts/cx-parse"
 JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 PROMPT="<task package prompt>"
 codex exec --json -C "$WORKTREE" --skip-git-repo-check \
-  -m gpt-5.4-codex -c model_reasoning_effort='"high"' \
+  -m gpt-5.4 -c model_reasoning_effort='"high"' \
   --yolo \
   "$PROMPT" >"$JSONL" 2>/dev/null
 SESSION_ID="$($CX session-id "$JSONL")"
@@ -395,16 +395,15 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
 
 | Model | Description | Best For |
 | --- | --- | --- |
-| `gpt-5.4-codex` | Latest frontier agentic coding model (default) | Complex multi-file tasks, architecture changes |
-| `gpt-5.3-codex` | Frontier agentic coding model (previous gen) | Stable fallback if 5.4 has issues |
+| `gpt-5.4` | Latest frontier model (default) | Complex multi-file tasks, architecture changes, general-purpose |
+| `gpt-5.3-codex` | Codex-optimized agentic coding model | Stable fallback, code-heavy tasks |
 | `gpt-5.3-codex-spark` | Ultra-fast coding model | Quick edits, simple tasks, rapid iteration |
 | `gpt-5.1-codex-max` | Codex-optimized flagship for deep and fast reasoning | Deep analysis, complex debugging |
-| `gpt-5.4` | Latest frontier model with broad improvements | General-purpose, knowledge-heavy tasks |
 | `gpt-5.1-codex-mini` | Optimized for codex, cheaper and faster | Cost-sensitive tasks, simple fixes |
 
 ## Running a Task
 1. Confirm the Task Package exists and is complete.
-2. Ask the user (via `AskUserQuestion`) which model to run (default: `gpt-5.4-codex`) AND which reasoning effort to use (`xhigh`, `high`, `medium`, or `low`) in a **single prompt with two questions**. Refer to the **Available Models** table above when presenting options.
+2. Ask the user (via `AskUserQuestion`) which model to run (default: `gpt-5.4`) AND which reasoning effort to use (`xhigh`, `high`, `medium`, or `low`) in a **single prompt with two questions**. Refer to the **Available Models** table above when presenting options.
 3. Select the permissions mode (see **Permissions Model** section below). Default is `--yolo` (full access). Use safe mode only when the user explicitly requests it or the task involves an untrusted codebase.
 4. Assemble the command with the appropriate options:
    - `--json` (REQUIRED — enables structured session ID extraction on stdout)
@@ -459,7 +458,7 @@ Always use `--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`) unless 
 ```bash
 # Standard command pattern (default)
 codex exec --yolo --skip-git-repo-check \
-  -m gpt-5.4-codex -c model_reasoning_effort='"high"' \
+  -m gpt-5.4 -c model_reasoning_effort='"high"' \
   "$PROMPT" 2>/dev/null
 ```
 
@@ -472,7 +471,7 @@ Use when working with **untrusted codebases** or when the user explicitly reques
 codex exec --skip-git-repo-check \
   --sandbox workspace-write --full-auto \
   -c sandbox_workspace_write.network_access=true \
-  -m gpt-5.4-codex -c model_reasoning_effort='"high"' \
+  -m gpt-5.4 -c model_reasoning_effort='"high"' \
   "$PROMPT" 2>/dev/null
 ```
 
