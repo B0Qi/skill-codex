@@ -16,7 +16,9 @@
 # Output: JSON to stdout on completion (from cx-parse watch)
 # Exit codes: 0=completed, 2=crashed/not-found, 4=timeout
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: no `set -e` — cx-parse watch exits non-zero on crash/timeout,
+# and we must still run the registry update below.
 
 COORD_ID="cx_$(date +%s)"
 COORD_DIR=".coord"

@@ -186,6 +186,8 @@ def _write_json_atomic(path, data):
 
 
 def _remove_silent(path):
+    if path is None:
+        return
     try:
         os.unlink(path)
     except OSError:
@@ -237,6 +239,7 @@ def cmd_watch(args):
     session_id = ""
     file_pos = 0  # track read position for efficient tailing
     token_usage = {}
+    last_agent_message = ""  # track latest agent_message for Responses API format
 
     def update_heartbeat():
         if not running_f:
@@ -274,17 +277,46 @@ def cmd_watch(args):
                 if tid and UUID_RE.match(tid):
                     session_id = tid
 
+            top_type = obj.get("type", "")
             payload = obj.get("payload") or obj
             ev_type = payload.get("type", "")
 
-            # Capture token usage
+            # Capture token usage — legacy format (event_msg/token_count)
             if ev_type == "token_count":
                 info = payload.get("info", {})
                 token_usage = info.get("total_token_usage", token_usage)
 
-            # task_complete — Codex finished
+            # Capture token usage — Responses API format (turn.completed)
+            if top_type == "turn.completed":
+                usage = obj.get("usage")
+                if usage:
+                    token_usage = usage
+
+            # Track latest agent_message — Responses API format
+            if top_type == "item.completed":
+                item = obj.get("item") or {}
+                if item.get("type") == "agent_message":
+                    last_agent_message = item.get("text", "")
+
+            # Legacy completion: event_msg/task_complete
             if ev_type == "task_complete":
                 response = payload.get("last_agent_message", "")
+                truncated = False
+                if cap and len(response) > cap:
+                    response = response[:cap]
+                    truncated = True
+                return {
+                    "status": "completed",
+                    "session_id": session_id,
+                    "response": response,
+                    "response_truncated": truncated,
+                    "elapsed_seconds": round(time.time() - start, 1),
+                    "token_usage": token_usage,
+                }
+
+            # Responses API completion: turn.completed
+            if top_type == "turn.completed":
+                response = last_agent_message
                 truncated = False
                 if cap and len(response) > cap:
                     response = response[:cap]
