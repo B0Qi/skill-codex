@@ -4,9 +4,10 @@
 
 | Task | Directory | Status | Started |
 |------|-----------|--------|---------|
+| Codex Session Sync Protocol | `codex-session-sync-protocol/` | Phase 2/5 | 2026-03-12 |
 
 ## Current Focus
-`notebooklm-programmatic-research/` - NotebookLM Programmatic Integration Research
+`codex-session-sync-protocol/` - Design protocol for Codex/Claude inter-agent task state synchronization
 
 ## Completed Tasks
 

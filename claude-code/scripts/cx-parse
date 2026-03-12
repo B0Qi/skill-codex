@@ -5,14 +5,17 @@ Subcommands:
   session-id   Extract thread_id from first line (O(1) read)
   response     Extract last agent_message response text
   extract      JSON output with session_id + text + metadata
+  watch        Block until Codex completes; manage .coord/ lifecycle
 
-Exit codes: 0=ok, 2=not-found/invalid, 3=parse-error
+Exit codes: 0=ok, 2=not-found/invalid, 3=parse-error, 4=timeout
 """
 
 import argparse
 import json
+import os
 import re
 import sys
+import time
 from contextlib import contextmanager
 
 UUID_RE = re.compile(
@@ -22,6 +25,7 @@ UUID_RE = re.compile(
 EXIT_OK = 0
 EXIT_NOT_FOUND = 2
 EXIT_PARSE_ERROR = 3
+EXIT_TIMEOUT = 4
 
 
 @contextmanager
@@ -167,6 +171,209 @@ def cmd_extract(args):
     return EXIT_OK if (session_id or last) else EXIT_NOT_FOUND
 
 
+# ── watch ────────────────────────────────────────────────────────
+
+def _write_json_atomic(path, data):
+    """Write JSON to path atomically via tmp+rename."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.rename(tmp, path)
+    except OSError:
+        pass
+
+
+def _remove_silent(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid):
+    if pid is None:
+        return True  # no PID to track — assume alive
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def cmd_watch(args):
+    """Block until Codex completes. Manage .coord/ running/done/failed lifecycle."""
+    jsonl_path = args.file
+    pid = args.pid
+    timeout = args.timeout or 600
+    cap = args.max_chars
+    coord_id = args.coord_id
+    coord_dir = args.coord_dir or ".coord"
+    interval = args.interval or 2
+
+    # State file paths (None if no coord_id)
+    running_f = (
+        os.path.join(coord_dir, "running", f"{coord_id}.json")
+        if coord_id
+        else None
+    )
+    done_f = (
+        os.path.join(coord_dir, "done", f"{coord_id}.json")
+        if coord_id
+        else None
+    )
+    failed_f = (
+        os.path.join(coord_dir, "failed", f"{coord_id}.json")
+        if coord_id
+        else None
+    )
+
+    start = time.time()
+    session_id = ""
+    file_pos = 0  # track read position for efficient tailing
+    token_usage = {}
+
+    def update_heartbeat():
+        if not running_f:
+            return
+        _write_json_atomic(running_f, {
+            "coord_id": coord_id,
+            "status": "running",
+            "session_id": session_id,
+            "pid": pid,
+            "elapsed_seconds": round(time.time() - start, 1),
+            "last_active": _now_iso(),
+        })
+
+    def scan_events():
+        """Read new JSONL lines from last position. Return result dict or None."""
+        nonlocal session_id, file_pos, token_usage
+
+        try:
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(file_pos)
+                new_lines = f.readlines()
+                file_pos = f.tell()
+        except FileNotFoundError:
+            return None
+
+        for line in new_lines:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # Session ID from first event (thread.started)
+            if not session_id:
+                tid = obj.get("thread_id", "")
+                if tid and UUID_RE.match(tid):
+                    session_id = tid
+
+            payload = obj.get("payload") or obj
+            ev_type = payload.get("type", "")
+
+            # Capture token usage
+            if ev_type == "token_count":
+                info = payload.get("info", {})
+                token_usage = info.get("total_token_usage", token_usage)
+
+            # task_complete — Codex finished
+            if ev_type == "task_complete":
+                response = payload.get("last_agent_message", "")
+                truncated = False
+                if cap and len(response) > cap:
+                    response = response[:cap]
+                    truncated = True
+                return {
+                    "status": "completed",
+                    "session_id": session_id,
+                    "response": response,
+                    "response_truncated": truncated,
+                    "elapsed_seconds": round(time.time() - start, 1),
+                    "token_usage": token_usage,
+                }
+
+        return None
+
+    def finish(result, terminal_dir_f):
+        """Write terminal state file, remove running file, print result."""
+        if terminal_dir_f:
+            _write_json_atomic(terminal_dir_f, {
+                "coord_id": coord_id,
+                "status": result["status"],
+                "session_id": session_id,
+                "finished_at": _now_iso(),
+                "elapsed_seconds": result["elapsed_seconds"],
+                "token_usage": token_usage,
+            })
+        _remove_silent(running_f)
+        print(json.dumps(result))
+
+    # ── Main loop ────────────────────────────────────────────────
+
+    # Wait for JSONL file to appear (Codex may take a moment to start)
+    wait_start = time.time()
+    while not os.path.exists(jsonl_path):
+        if time.time() - wait_start > 30:
+            result = {
+                "status": "error",
+                "error": f"JSONL file not created after 30s: {jsonl_path}",
+                "session_id": "",
+                "elapsed_seconds": round(time.time() - start, 1),
+            }
+            print(json.dumps(result))
+            return EXIT_NOT_FOUND
+        time.sleep(0.5)
+
+    update_heartbeat()
+
+    while True:
+        elapsed = time.time() - start
+
+        # Check JSONL for completion
+        result = scan_events()
+        if result:
+            finish(result, done_f)
+            return EXIT_OK
+
+        # Check timeout
+        if elapsed > timeout:
+            result = {
+                "status": "timeout",
+                "session_id": session_id,
+                "elapsed_seconds": round(elapsed, 1),
+            }
+            # Keep running_f — session may still be resumable
+            print(json.dumps(result))
+            return EXIT_TIMEOUT
+
+        # Check if process died
+        if not _pid_alive(pid):
+            # Grace period — final events may not be flushed yet
+            time.sleep(1)
+            result = scan_events()
+            if result:
+                finish(result, done_f)
+                return EXIT_OK
+
+            # Process died without task_complete
+            result = {
+                "status": "crashed",
+                "session_id": session_id,
+                "elapsed_seconds": round(elapsed, 1),
+            }
+            finish(result, failed_f)
+            return EXIT_NOT_FOUND
+
+        update_heartbeat()
+        time.sleep(interval)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 def main():
@@ -218,6 +425,49 @@ def main():
         help="Save stdin to PATH, then parse the saved file",
     )
 
+    # watch
+    p_watch = sub.add_parser(
+        "watch",
+        help="Block until Codex completes; manage .coord/ lifecycle",
+    )
+    p_watch.add_argument(
+        "file", help="JSONL file being written by codex exec"
+    )
+    p_watch.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help="Codex process PID to monitor",
+    )
+    p_watch.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="Max wait time in seconds (default: 600)",
+    )
+    p_watch.add_argument(
+        "--max-chars",
+        type=int,
+        default=None,
+        help="Truncate response to N chars",
+    )
+    p_watch.add_argument(
+        "--coord-id",
+        default=None,
+        help="Coord ID for .coord/ state file management",
+    )
+    p_watch.add_argument(
+        "--coord-dir",
+        default=".coord",
+        help="Path to .coord/ directory (default: .coord)",
+    )
+    p_watch.add_argument(
+        "--interval",
+        type=int,
+        default=2,
+        help="Poll interval in seconds (default: 2)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "session-id":
@@ -226,6 +476,8 @@ def main():
         sys.exit(cmd_response(args))
     elif args.command == "extract":
         sys.exit(cmd_extract(args))
+    elif args.command == "watch":
+        sys.exit(cmd_watch(args))
 
 
 if __name__ == "__main__":

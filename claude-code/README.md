@@ -38,16 +38,13 @@ Use codex to analyze this repository and suggest improvements for my claude code
 
 **Claude Code response:**
 Claude will activate the Codex skill and:
-1. Ask which model to use (default: `gpt-5.3-codex`) unless already specified in your prompt.
+1. Ask which model to use (default: `gpt-5.4`) unless already specified in your prompt.
 2. Ask which reasoning effort level (`xhigh`, `high`, `medium`, or `low`) unless already specified in your prompt.
-3. Select appropriate sandbox mode (defaults to `read-only` for analysis)
+3. Select permissions mode (defaults to `--yolo` for full access; safe mode on request)
 4. Run a command like:
 ```bash
-codex exec -m gpt-5.3-codex \
-  --config model_reasoning_effort="high" \
-  --sandbox read-only \
-  --full-auto \
-  --skip-git-repo-check \
+codex exec --json --yolo --skip-git-repo-check \
+  -m gpt-5.4 -c model_reasoning_effort='"high"' \
   "Analyze this Claude Code skill repository comprehensively..." 2>/dev/null
 ```
 
@@ -88,10 +85,10 @@ When resuming, the skill uses an explicit session ID from the registry (not `--l
 Resume command pattern:
 
 ```bash
-echo "<resume prompt>" | codex exec --skip-git-repo-check resume <SESSION_ID> - 2>/dev/null
+codex exec --json --yolo --skip-git-repo-check resume <SESSION_ID> "Resume prompt here" 2>/dev/null
 ```
 
-In parallel mode, include `-C <worktree-path>` so the resumed session continues in the correct worktree.
+In parallel mode, `cd` to the worktree directory first (`resume` does not support `-C`).
 
 ### Detailed Instructions
 See `SKILL.md` for complete operational instructions, CLI options, and workflow guidance.
