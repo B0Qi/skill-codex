@@ -103,23 +103,18 @@ Claude Code runs the whole thing with `run_in_background` and gets notified auto
 
 ### Launch Pattern
 
+Use `cx-run` — a single command that wraps the entire lifecycle. Run it with `run_in_background`:
+
 ```bash
-CX="$HOME/.claude/skills/codex/scripts/cx-parse"
-JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
-COORD_ID="cx_$(date +%s)"
-mkdir -p .coord/running .coord/done .coord/failed
-
-# Launch Codex in background
-codex exec --json --yolo --skip-git-repo-check \
+$HOME/.claude/skills/codex/scripts/cx-run --timeout 600 -- \
+  codex exec --json --yolo --skip-git-repo-check \
   -m gpt-5.4 -c model_reasoning_effort='"high"' \
-  "$PROMPT" >"$JSONL" 2>/dev/null &
-CODEX_PID=$!
-
-# Watch blocks until completion — run this with run_in_background
-$CX watch "$JSONL" --pid $CODEX_PID --coord-id "$COORD_ID" --max-chars 12288 --timeout 600
+  "$PROMPT"
 ```
 
-**Watch output** (JSON to stdout):
+`cx-run` handles everything internally: creates temp JSONL, launches Codex in background, extracts session ID, registers in `.coord/sessions.jsonl`, starts `cx-parse watch` to monitor PID + JSONL stream, manages `.coord/running/done/failed/` state files, and outputs result JSON when done.
+
+**Output** (JSON to stdout on completion):
 ```json
 {"status":"completed","session_id":"019c...","response":"...","response_truncated":false,"elapsed_seconds":45.2,"token_usage":{...}}
 ```
@@ -232,37 +227,26 @@ Run `codex --help` or check OpenAI documentation for the latest model list. Comm
 
 ## Running a Task
 
-1. **Guard check**: before starting, scan `.coord/running/` for active entries in the current `cwd`. If any exist, do NOT proceed — resume the existing session or wait. See Task State Synchronization.
-2. **Generate coord_id**: `COORD_ID="cx_$(date +%s)"`. Create state directories: `mkdir -p .coord/running .coord/done .coord/failed`.
-3. Confirm the Task Package is complete (include `Coord-ID` and `State Protocol`).
-4. Ask the user which model (default: `gpt-5.4`) and reasoning effort (`xhigh`/`high`/`medium`/`low`) in a **single prompt**.
-5. Select permissions mode (default `--yolo`; safe mode only on explicit request — see Permissions Model below).
-6. Assemble the command:
-   - `--json` (REQUIRED — enables structured session ID extraction)
-   - `-m <MODEL>` and `-c model_reasoning_effort='"<level>"'` (TOML: single-quote + double-quote)
-   - `--yolo` (default) or safe mode flags
-   - `--skip-git-repo-check`
-7. **Prompt passing** — NEVER use `-p` with multiline text (may be misparsed as config profile). NEVER use trailing `-` for stdin.
-   - **Short prompts**: pass as positional arg: `codex exec [OPTIONS] "prompt"`
-   - **Long/multiline prompts** (Task Packages): write to temp file, then:
-     ```bash
-     PROMPT=$(cat /path/to/prompt_file.txt)
-     ```
-8. **Launch with watch** — use the pattern from Task State Synchronization. Run the entire block with `run_in_background`:
+1. **Guard check**: scan `.coord/running/` for active entries. If any exist, do NOT proceed — wait for the notification or resume the existing session.
+2. Confirm the Task Package is complete (include `Coord-ID`).
+3. Ask the user which model (default: `gpt-5.4`) and reasoning effort (`xhigh`/`high`/`medium`/`low`) in a **single prompt**.
+4. **Prompt passing**: for long/multiline prompts (Task Packages), write to a temp file first: `PROMPT=$(cat /path/to/task_package.txt)`. NEVER use `-p` with multiline text.
+5. **Launch with `cx-run`** — a single `run_in_background` command that handles the entire lifecycle (launch, session registry, watch, state files):
    ```bash
-   CX="$HOME/.claude/skills/codex/scripts/cx-parse"
-   JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
-   codex exec --json [OPTIONS] "$PROMPT" >"$JSONL" 2>/dev/null &
-   CODEX_PID=$!
-   $CX watch "$JSONL" --pid $CODEX_PID --coord-id "$COORD_ID" --max-chars 12288 --timeout 600
+   $HOME/.claude/skills/codex/scripts/cx-run --timeout 600 -- \
+     codex exec --json --yolo --skip-git-repo-check \
+     -m gpt-5.4 -c model_reasoning_effort='"high"' \
+     "$PROMPT"
    ```
-   When the background task completes, Claude Code receives a notification with the result JSON containing `status`, `session_id`, `response`, `elapsed_seconds`, and `token_usage`.
-   > For foreground-only or fallback extraction patterns, see `references/extraction-patterns.md`.
-9. **Extract session ID** from the watch output. Append a registry entry (with `coord_id`) to `.coord/sessions.jsonl`. **Validate** UUID format.
-10. After completion, check `status` in the watch output. Update registry accordingly. Inform the user: "You can resume this Codex session at any time."
-11. For resume: look up session ID from registry, follow Resume Protocol above.
-12. **stderr handling**: `2>/dev/null` suppresses thinking tokens. On non-zero exit, re-run without it to capture diagnostics.
-13. **Path validation for `-C`**: always use absolute paths. Verify with `test -d`.
+   `cx-run` internally: launches Codex → extracts session ID → registers in `.coord/sessions.jsonl` → monitors via `cx-parse watch` → manages `.coord/running/done/failed/` → outputs result JSON → updates registry.
+6. **Tell the user** Codex is running, then **stop**. Do NOT poll, check status, or edit files. Wait for the background task notification.
+7. **When notified**, read the result JSON:
+   ```json
+   {"status":"completed","session_id":"...","response":"...","elapsed_seconds":45.2,"token_usage":{...}}
+   ```
+   Proceed to Accept phase based on `status`: `completed` → review, `crashed` → investigate or resume, `timeout` → resume.
+8. For resume: look up `session_id` from the notification output, follow Resume Protocol.
+9. For safe mode, add `--sandbox workspace-write --full-auto -c sandbox_workspace_write.network_access=true` instead of `--yolo`. For worktree path, add `-C /absolute/path`.
 
 ## Permissions Model
 

@@ -1,0 +1,85 @@
+#!/bin/bash
+# cx-run — launch Codex and watch to completion in one command.
+#
+# Handles the full lifecycle: launch → session registry → watch → notify.
+# Designed for Claude Code's run_in_background — zero polling, pure notification.
+#
+# Usage:
+#   cx-run [OPTIONS] -- codex exec --json --yolo ... "$PROMPT"
+#
+# Options:
+#   --coord-id ID       Coord ID (default: cx_<timestamp>)
+#   --coord-dir DIR     .coord directory (default: .coord)
+#   --timeout SECONDS   Max wait time (default: 600)
+#   --max-chars N       Truncate response (default: 12288)
+#
+# Output: JSON to stdout on completion (from cx-parse watch)
+# Exit codes: 0=completed, 2=crashed/not-found, 4=timeout
+
+set -euo pipefail
+
+COORD_ID="cx_$(date +%s)"
+COORD_DIR=".coord"
+TIMEOUT=600
+MAX_CHARS=12288
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --coord-id)  COORD_ID="$2"; shift 2;;
+    --coord-dir) COORD_DIR="$2"; shift 2;;
+    --timeout)   TIMEOUT="$2";   shift 2;;
+    --max-chars) MAX_CHARS="$2";  shift 2;;
+    --)          shift; break;;
+    *)           break;;
+  esac
+done
+
+if [ $# -eq 0 ]; then
+  echo '{"status":"error","error":"No command. Usage: cx-run [OPTIONS] -- codex exec ..."}' >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CX="$SCRIPT_DIR/cx-parse"
+JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
+
+mkdir -p "$COORD_DIR/running" "$COORD_DIR/done" "$COORD_DIR/failed"
+
+# ── Launch ───────────────────────────────────────────────────────
+# Command after -- is expected to include --json and write JSONL to stdout.
+"$@" >"$JSONL" 2>/dev/null &
+CMD_PID=$!
+
+# ── Extract session ID (max 30s) ────────────────────────────────
+SESSION_ID=""
+for _i in $(seq 1 60); do
+  if [ -s "$JSONL" ]; then
+    SESSION_ID="$("$CX" session-id "$JSONL" 2>/dev/null)" && [ -n "$SESSION_ID" ] && break
+  fi
+  sleep 0.5
+done
+
+# ── Register session ────────────────────────────────────────────
+printf '{"agent":"codex","coord_id":"%s","session_id":"%s","status":"running","cwd":"%s","mode":"serial","created_at":"%s"}\n' \
+  "$COORD_ID" "$SESSION_ID" "$(pwd)" "$(date -Iseconds)" \
+  >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
+
+# ── Watch — blocks until completion ─────────────────────────────
+"$CX" watch "$JSONL" \
+  --pid "$CMD_PID" \
+  --coord-id "$COORD_ID" \
+  --coord-dir "$COORD_DIR" \
+  --max-chars "$MAX_CHARS" \
+  --timeout "$TIMEOUT"
+EXIT_CODE=$?
+
+# ── Update registry ─────────────────────────────────────────────
+FINAL_STATUS="done"
+[ -f "$COORD_DIR/failed/$COORD_ID.json" ] && FINAL_STATUS="failed"
+[ $EXIT_CODE -eq 4 ] && FINAL_STATUS="timeout"
+
+printf '{"agent":"codex","coord_id":"%s","session_id":"%s","status":"%s","updated_at":"%s"}\n' \
+  "$COORD_ID" "$SESSION_ID" "$FINAL_STATUS" "$(date -Iseconds)" \
+  >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
+
+exit $EXIT_CODE
