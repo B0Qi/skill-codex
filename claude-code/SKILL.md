@@ -116,10 +116,13 @@ $HOME/.claude/skills/codex/scripts/cx-run --timeout 600 -- \
 
 **Output** (JSON to stdout on completion):
 ```json
-{"status":"completed","session_id":"019c...","response":"...","response_truncated":false,"elapsed_seconds":45.2,"token_usage":{...}}
+{"status":"completed","session_id":"019c...","response":"...","response_truncated":false,"output_tokens":1234,"elapsed_seconds":45.2,"token_usage":{...}}
 ```
 
-Possible `status` values: `completed`, `crashed`, `timeout`, `error`.
+Key fields:
+- `status`: `completed`, `crashed`, `timeout`, or `error`
+- `response_truncated`: `true` when response was capped by `--max-chars` (context protection — full response remains in the JSONL file)
+- `output_tokens`: model's raw output token count — use this to detect model-level truncation (see Truncation Handling)
 
 ### Guard Check (Claude Code)
 
@@ -139,10 +142,56 @@ This is a **task-level guard** in serial mode. In parallel mode, the file owners
 - **Timeout**: Watch exits with timeout status but keeps the running file — the Codex session may still be alive and resumable.
 - **Context loss**: Claude Code scans `.coord/running/` and `.coord/sessions.jsonl` to discover in-flight tasks.
 - **Resume**: Generate a new `coord_id` for the resumed session's watcher.
+- **Truncation**: See Truncation Handling below.
+
+### Truncation Handling
+
+When Codex hits the model's max output tokens, the response is cut off mid-stream. The JSONL still emits `turn.completed` so `status` is `"completed"`, but the response is incomplete. Detect this and resume.
+
+**Detection — check `output_tokens` in the result JSON:**
+
+| `output_tokens` | Likely state | Action |
+| --- | --- | --- |
+| < 30,000 | Normal completion | Proceed to Accept |
+| ≥ 30,000 | Likely model-truncated | Check response, resume if incomplete |
+
+> These thresholds are approximate. When in doubt, check if the response ends mid-sentence or mid-code-block.
+
+**Resume on truncation** — use `cx-run --resume`:
+
+```bash
+$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID> --timeout 600 -- \
+```
+
+`cx-run --resume` automatically: inherits `--json --yolo --skip-git-repo-check`, sends a "Continue from where you left off" prompt, registers in the session registry with `resumed_from`, and watches to completion.
+
+**Prevention — add a checkpoint hint to Task Packages for long-output tasks:**
+
+When the task is expected to produce long output (code generation, reviews, reports), add this to the Task Package `Constraints`:
+
+```
+- If output is getting long, pause at a natural checkpoint and summarize progress so far before continuing.
+```
+
+This gives the model a chance to produce a complete intermediate result rather than being cut off mid-thought.
 
 ## Resume Protocol
 
-When resuming a Codex session (after timeout, context loss, or user request):
+When resuming a Codex session (after timeout, truncation, context loss, or user request):
+
+### Quick Resume (preferred)
+
+Use `cx-run --resume` — handles everything automatically:
+
+```bash
+$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID> --timeout 600
+```
+
+This inherits `--json --yolo --skip-git-repo-check`, sends a "Continue from where you left off" prompt, registers the resume in the session registry, and watches to completion. Run with `run_in_background` just like the original launch.
+
+### Manual Resume
+
+When you need a custom resume prompt or more control:
 
 1. **Resume with a self-check prompt:**
    ```
@@ -167,7 +216,9 @@ When resuming a Codex session (after timeout, context loss, or user request):
 
 4. **Update the registry** after resume completes (status, updated_at, notes).
 
-5. **Resume count tracking**: track in `notes` field (e.g., `"notes":"resume #3"`). After **3 resumes**, checkpoint to `.coord/<session_id>-summary.md`. After **5 resumes**, recommend a fresh session with a new Task Package.
+### Resume Limits
+
+Track resume count in `notes` field (e.g., `"notes":"resume #3"`). After **3 resumes**, checkpoint to `.coord/<session_id>-summary.md`. After **5 resumes**, recommend a fresh session with a new Task Package.
 
 ### Context Recovery
 
@@ -240,12 +291,12 @@ Run `codex --help` or check OpenAI documentation for the latest model list. Comm
    ```
    `cx-run` internally: launches Codex → extracts session ID → registers in `.coord/sessions.jsonl` → monitors via `cx-parse watch` → manages `.coord/running/done/failed/` → outputs result JSON → updates registry.
 6. **Tell the user** Codex is running, then **stop**. Do NOT poll, check status, or edit files. Wait for the background task notification.
-7. **When notified**, read the result JSON:
-   ```json
-   {"status":"completed","session_id":"...","response":"...","elapsed_seconds":45.2,"token_usage":{...}}
-   ```
-   Proceed to Accept phase based on `status`: `completed` → review, `crashed` → investigate or resume, `timeout` → resume.
-8. For resume: look up `session_id` from the notification output, follow Resume Protocol.
+7. **When notified**, read the result JSON and decide next action:
+   - `status: completed` + `output_tokens < 30000` → proceed to Accept phase.
+   - `status: completed` + `output_tokens ≥ 30000` → check if response ends mid-sentence/mid-code. If truncated, auto-resume with `cx-run --resume <session_id>`.
+   - `status: crashed` → investigate or resume.
+   - `status: timeout` → resume.
+8. For resume: use `cx-run --resume <session_id>` (see Resume Protocol). Run with `run_in_background`.
 9. For safe mode, add `--sandbox workspace-write --full-auto -c sandbox_workspace_write.network_access=true` instead of `--yolo`. For worktree path, add `-C /absolute/path`.
 
 ## Permissions Model
@@ -314,6 +365,14 @@ See `references/parallel-mode.md` — File Ownership Locking section.
 - After every `codex` command, update `.coord/sessions.jsonl` and confirm next steps with the user.
 - Restate the chosen model and reasoning effort when proposing follow-up actions.
 - If context is lost, read `.coord/sessions.jsonl` to recover state before taking action.
+
+## Context Protection
+
+- **NEVER** capture raw JSONL into shell variables or read full JSONL files into context. Use `cx-parse extract` or `cx-parse response` for targeted extraction.
+- `cx-run` uses `--max-chars 12288` by default — responses longer than this are truncated in the result JSON. The full response remains in the JSONL temp file.
+- When reading `.coord/sessions.jsonl`: always use `tail -n 50`, never `cat` the full file.
+- When reviewing diffs: use `| head -200` for large outputs.
+- For full extraction details, see `references/extraction-patterns.md`.
 
 ## Error Handling
 

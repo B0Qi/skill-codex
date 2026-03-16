@@ -255,7 +255,7 @@ def cmd_watch(args):
 
     def scan_events():
         """Read new JSONL lines from last position. Return result dict or None."""
-        nonlocal session_id, file_pos, token_usage
+        nonlocal session_id, file_pos, token_usage, last_agent_message
 
         try:
             with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
@@ -298,34 +298,31 @@ def cmd_watch(args):
                 if item.get("type") == "agent_message":
                     last_agent_message = item.get("text", "")
 
+            # ── Completion detection ─────────────────────────
+
+            completed_response = None
+
             # Legacy completion: event_msg/task_complete
             if ev_type == "task_complete":
-                response = payload.get("last_agent_message", "")
-                truncated = False
-                if cap and len(response) > cap:
-                    response = response[:cap]
-                    truncated = True
-                return {
-                    "status": "completed",
-                    "session_id": session_id,
-                    "response": response,
-                    "response_truncated": truncated,
-                    "elapsed_seconds": round(time.time() - start, 1),
-                    "token_usage": token_usage,
-                }
+                completed_response = payload.get("last_agent_message", "")
 
             # Responses API completion: turn.completed
             if top_type == "turn.completed":
-                response = last_agent_message
-                truncated = False
+                completed_response = last_agent_message
+
+            if completed_response is not None:
+                response = completed_response
+                context_truncated = False
                 if cap and len(response) > cap:
                     response = response[:cap]
-                    truncated = True
+                    context_truncated = True
+                output_tokens = (token_usage or {}).get("output_tokens", 0)
                 return {
                     "status": "completed",
                     "session_id": session_id,
                     "response": response,
-                    "response_truncated": truncated,
+                    "response_truncated": context_truncated,
+                    "output_tokens": output_tokens,
                     "elapsed_seconds": round(time.time() - start, 1),
                     "token_usage": token_usage,
                 }
