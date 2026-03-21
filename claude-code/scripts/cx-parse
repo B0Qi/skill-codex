@@ -212,7 +212,7 @@ def cmd_watch(args):
     """Block until Codex completes. Manage .coord/ running/done/failed lifecycle."""
     jsonl_path = args.file
     pid = args.pid
-    timeout = args.timeout or 600
+    timeout = args.timeout  # 0 = disabled (watch indefinitely while PID alive)
     cap = args.max_chars
     coord_id = args.coord_id
     coord_dir = args.coord_dir or ".coord"
@@ -370,18 +370,7 @@ def cmd_watch(args):
             finish(result, done_f)
             return EXIT_OK
 
-        # Check timeout
-        if elapsed > timeout:
-            result = {
-                "status": "timeout",
-                "session_id": session_id,
-                "elapsed_seconds": round(elapsed, 1),
-            }
-            # Keep running_f — session may still be resumable
-            print(json.dumps(result))
-            return EXIT_TIMEOUT
-
-        # Check if process died
+        # Check if process died (always check before timeout)
         if not _pid_alive(pid):
             # Grace period — final events may not be flushed yet
             time.sleep(1)
@@ -398,6 +387,20 @@ def cmd_watch(args):
             }
             finish(result, failed_f)
             return EXIT_NOT_FOUND
+
+        # Check timeout (only if enabled and PID is confirmed dead above)
+        # timeout=0 means disabled — watch indefinitely while PID is alive
+        if timeout > 0 and elapsed > timeout:
+            result = {
+                "status": "watch_timeout",
+                "session_id": session_id,
+                "elapsed_seconds": round(elapsed, 1),
+                "pid_alive": True,
+                "note": "Watcher timed out but Codex process is still alive. Do NOT take over — reattach or wait.",
+            }
+            # Keep running_f — Codex is still working
+            print(json.dumps(result))
+            return EXIT_TIMEOUT
 
         update_heartbeat()
         time.sleep(interval)
@@ -471,8 +474,8 @@ def main():
     p_watch.add_argument(
         "--timeout",
         type=int,
-        default=600,
-        help="Max wait time in seconds (default: 600)",
+        default=0,
+        help="Max watch time in seconds; 0=disabled/indefinite (default: 0)",
     )
     p_watch.add_argument(
         "--max-chars",

@@ -5,6 +5,19 @@ description: Use when the user asks to run Codex CLI (codex exec, codex resume) 
 
 # Codex Skill Guide
 
+## Delegation Discipline
+
+The entire purpose of this skill is to delegate work to Codex and let it finish autonomously. Claude Code's role after launch is to **wait** — not to help, not to "speed things up", not to take over. Long-running tasks are normal and expected; a task taking 5–10 minutes (or longer) is not a sign that something is wrong.
+
+**Rules that must never be broken:**
+
+1. **Never kill a Codex process.** Do not run `kill`, `pkill`, `killall`, or any signal against a Codex PID. Do not cancel a background task that is running Codex. If you feel the urge to terminate Codex and do the work yourself — that impulse is wrong. Resist it.
+2. **Never take over delegated work.** Once a task has been sent to Codex, that task belongs to Codex until it reaches a verified terminal state (completion event or confirmed process death). A watcher timeout is NOT a terminal state — it only means the watcher stopped waiting, not that Codex stopped working. Do not start editing the same files, running the same commands, or reimplementing the same logic. Even if you "know" how to do it faster — the user chose to delegate, so respect that choice.
+3. **Never preemptively intervene.** Do not check on Codex "just to see how it's going" and then decide to take over. Do not interpret silence or slow progress as failure. Wait for the background task notification.
+4. **After launch, stop working on that task.** Tell the user Codex is running, then either wait for the notification or work on something unrelated if the user asks. Do not fill the waiting time by doing the delegated task yourself.
+
+The value of delegation is that Codex works independently. Every time CC kills a Codex process or takes over mid-task, it wastes the tokens Codex already spent, confuses the file state, and defeats the purpose of having two agents. The correct action when a long task is running is: do nothing and wait.
+
 ## Collaboration Modes
 
 This skill supports two collaboration modes between **Claude Code** and **Codex**. Choose the mode based on task complexity.
@@ -69,7 +82,7 @@ Entries without `agent` or `session_ref` are treated as legacy Codex entries.
 
 1. **On launch**: extract session ID, append entry with `status: running`.
 2. **On completion**: update status to `done`.
-3. **On timeout/interrupt**: status stays `running` — resume on next interaction.
+3. **On watch timeout** (rare — timeout is disabled by default): status stays `running` — Codex process may still be alive. Reattach or wait, do NOT take over.
 4. **On failure**: update status to `failed`, add error details to `notes`.
 
 > **Append-only log hygiene:** Always use `tail -n 50` when reading `.coord/sessions.jsonl` and `.coord/events.jsonl`. Never `cat` the entire file into context.
@@ -97,7 +110,7 @@ COORD_ID="cx_$(date +%s)"
 3. **Writes heartbeat** to `.coord/running/<coord_id>.json` every 2 seconds while Codex is alive
 4. **On completion**: writes `.coord/done/<coord_id>.json`, removes running file, outputs result JSON
 5. **On crash**: writes `.coord/failed/<coord_id>.json`, removes running file
-6. **On timeout**: keeps running file (session may be resumable), outputs timeout status
+6. **On watch timeout** (only if `--timeout` is explicitly set): keeps running file, outputs `watch_timeout` status. Codex process is still alive — this is a watcher limit, not a task failure
 
 Claude Code runs the whole thing with `run_in_background` and gets notified automatically — zero polling, zero wasted tokens.
 
@@ -106,11 +119,13 @@ Claude Code runs the whole thing with `run_in_background` and gets notified auto
 Use `cx-run` — a single command that wraps the entire lifecycle. Run it with `run_in_background`:
 
 ```bash
-$HOME/.claude/skills/codex/scripts/cx-run --timeout 600 -- \
+$HOME/.claude/skills/codex/scripts/cx-run -- \
   codex exec --json --yolo --skip-git-repo-check \
   -m gpt-5.4 -c model_reasoning_effort='"high"' \
   "$PROMPT"
 ```
+
+By default, `cx-run` watches indefinitely — it waits as long as the Codex process is alive and only exits on completion or crash. Use `--timeout N` only if you need an explicit hard ceiling (rare).
 
 `cx-run` handles everything internally: creates temp JSONL, launches Codex in background, extracts session ID, registers in `.coord/sessions.jsonl`, starts `cx-parse watch` to monitor PID + JSONL stream, manages `.coord/running/done/failed/` state files, and outputs result JSON when done.
 
@@ -120,7 +135,7 @@ $HOME/.claude/skills/codex/scripts/cx-run --timeout 600 -- \
 ```
 
 Key fields:
-- `status`: `completed`, `crashed`, `timeout`, or `error`
+- `status`: `completed`, `crashed`, `watch_timeout` (watcher limit, not task failure — Codex may still be alive), or `error`
 - `response_truncated`: `true` when response was capped by `--max-chars` (context protection — full response remains in the JSONL file)
 - `output_tokens`: model's raw output token count — use this to detect model-level truncation (see Truncation Handling)
 
@@ -131,15 +146,18 @@ Key fields:
 1. Check `.coord/running/` for any `.json` files.
 2. If an active entry exists (heartbeat `last_active` is fresh):
    - **Do NOT edit files.** Codex is still working.
-   - Inform the user, or wait for the background task notification.
-3. If no active entries, or only stale entries with a matching `done/` or `failed/` file: proceed normally.
+   - **Do NOT kill the Codex process.** Do not run `kill`, `pkill`, or any signal against it.
+   - **Do NOT start doing the delegated work yourself.** This is the most common mistake — CC sees an active task and decides to "help" by doing it in parallel. Don't.
+   - Inform the user that Codex is still running, and wait for the background task notification.
+3. If heartbeat is stale (not updated recently) but no matching `done/` or `failed/` file exists: the Codex process may still be alive but the watcher stopped. **Verify PID liveness** before proceeding — check the `pid` field in the running file and run `kill -0 <pid>` to test. If the PID is alive, do NOT edit files.
+4. Only proceed normally if: (a) no running entries exist, or (b) a matching `done/` or `failed/` file confirms the task ended.
 
 This is a **task-level guard** in serial mode. In parallel mode, the file ownership rules in `references/parallel-mode.md` apply instead.
 
 ### Edge Cases
 
-- **Crash**: `cx-parse watch` detects PID death, writes `failed/<coord_id>.json`, removes running file. Claude Code reads the failure and decides to resume or take over.
-- **Timeout**: Watch exits with timeout status but keeps the running file — the Codex session may still be alive and resumable.
+- **Crash**: `cx-parse watch` detects PID death, writes `failed/<coord_id>.json`, removes running file. Claude Code reads the failure and decides to resume or ask the user — never silently take over.
+- **Watch timeout** (only if `--timeout` was explicitly set): Watch exits with `watch_timeout` status but keeps the running file — Codex process is still alive. Do NOT take over. Either reattach a new watcher or wait for the user to decide.
 - **Context loss**: Claude Code scans `.coord/running/` and `.coord/sessions.jsonl` to discover in-flight tasks.
 - **Resume**: Generate a new `coord_id` for the resumed session's watcher.
 - **Truncation**: See Truncation Handling below.
@@ -160,7 +178,7 @@ When Codex hits the model's max output tokens, the response is cut off mid-strea
 **Resume on truncation** — use `cx-run --resume`:
 
 ```bash
-$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID> --timeout 600 -- \
+$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID> -- \
 ```
 
 `cx-run --resume` automatically: inherits `--json --yolo --skip-git-repo-check`, sends a "Continue from where you left off" prompt, registers in the session registry with `resumed_from`, and watches to completion.
@@ -177,14 +195,14 @@ This gives the model a chance to produce a complete intermediate result rather t
 
 ## Resume Protocol
 
-When resuming a Codex session (after timeout, truncation, context loss, or user request):
+When resuming a Codex session (after crash, truncation, context loss, or user request):
 
 ### Quick Resume (preferred)
 
 Use `cx-run --resume` — handles everything automatically:
 
 ```bash
-$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID> --timeout 600
+$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID>
 ```
 
 This inherits `--json --yolo --skip-git-repo-check`, sends a "Continue from where you left off" prompt, registers the resume in the session registry, and watches to completion. Run with `run_in_background` just like the original launch.
@@ -205,14 +223,15 @@ When you need a custom resume prompt or more control:
 
 2. **Construct the resume command** from `session_ref` in the registry:
    ```bash
-   codex exec --json --yolo --skip-git-repo-check resume <session_ref.value> "Resume prompt here" 2>/dev/null
+   codex exec resume <session_ref.value> "Resume prompt here" --json --yolo --skip-git-repo-check 2>/dev/null
    ```
+   - Syntax: `codex exec resume <SID> "prompt" [flags]` — the `resume` subcommand comes right after `exec`, then session ID, then prompt, then flags.
    - `--json` and `--yolo` are REQUIRED on resume — permissions and output mode do not carry over from the original session.
    - **CWD matters**: `cd` to the recorded `cwd` before resuming. `resume` does NOT support `-C`.
    - Fallback: use `--all` to bypass CWD filtering: `resume --all <SESSION_ID>`.
    - When outputting resume commands for the user, always include the `cd` prefix.
 
-3. **After timeout/error**: temporarily remove `2>/dev/null` to capture diagnostics.
+3. **After crash/error**: temporarily remove `2>/dev/null` to capture diagnostics.
 
 4. **Update the registry** after resume completes (status, updated_at, notes).
 
@@ -284,18 +303,19 @@ Run `codex --help` or check OpenAI documentation for the latest model list. Comm
 4. **Prompt passing**: for long/multiline prompts (Task Packages), write to a temp file first: `PROMPT=$(cat /path/to/task_package.txt)`. NEVER use `-p` with multiline text.
 5. **Launch with `cx-run`** — a single `run_in_background` command that handles the entire lifecycle (launch, session registry, watch, state files):
    ```bash
-   $HOME/.claude/skills/codex/scripts/cx-run --timeout 600 -- \
+   $HOME/.claude/skills/codex/scripts/cx-run -- \
      codex exec --json --yolo --skip-git-repo-check \
      -m gpt-5.4 -c model_reasoning_effort='"high"' \
      "$PROMPT"
    ```
+   By default `cx-run` watches indefinitely until Codex completes or crashes. Do NOT add `--timeout` unless the user explicitly requests a hard ceiling.
    `cx-run` internally: launches Codex → extracts session ID → registers in `.coord/sessions.jsonl` → monitors via `cx-parse watch` → manages `.coord/running/done/failed/` → outputs result JSON → updates registry.
-6. **Tell the user** Codex is running, then **stop**. Do NOT poll, check status, or edit files. Wait for the background task notification.
+6. **Tell the user** Codex is running, then **stop completely**. Do NOT poll, check status, edit files, or work on the delegated task in any way. Do NOT kill the Codex process — even if it seems slow, even if you think you could do it faster, even if the user asks a follow-up question about the task. Wait for the background task notification. Long-running tasks (5–15+ minutes) are normal for complex work. If the user asks about progress, tell them Codex is still running — do not intervene.
 7. **When notified**, read the result JSON and decide next action:
    - `status: completed` + `output_tokens < 30000` → proceed to Accept phase.
    - `status: completed` + `output_tokens ≥ 30000` → check if response ends mid-sentence/mid-code. If truncated, auto-resume with `cx-run --resume <session_id>`.
-   - `status: crashed` → investigate or resume.
-   - `status: timeout` → resume.
+   - `status: crashed` (PID confirmed dead) → attempt resume via `cx-run --resume`, or ask the user. Never silently take over the work.
+   - `status: watch_timeout` (Codex still alive) → this is NOT a failure. The watcher stopped but Codex is still working. Do NOT take over. Do NOT kill the process. Either relaunch `cx-run` to reattach, or inform the user and wait.
 8. For resume: use `cx-run --resume <session_id>` (see Resume Protocol). Run with `run_in_background`.
 9. For safe mode, add `--sandbox workspace-write --full-auto -c sandbox_workspace_write.network_access=true` instead of `--yolo`. For worktree path, add `-C /absolute/path`.
 
@@ -381,4 +401,6 @@ See `references/parallel-mode.md` — File Ownership Locking section.
 - Summarize warnings/partial results and ask for direction.
 - If phase/ownership boundaries are violated, stop and clarify.
 - **Parallel mode**: fall back to serial if worktree creation fails.
-- **Timeout recovery**: look up session ID from registry, resume per Resume Protocol. Temporarily remove `2>/dev/null` on first resume after timeout.
+- **Watch timeout is not a task failure.** `watch_timeout` means the watcher stopped waiting, not that Codex stopped working. The Codex process is still alive. Do NOT treat this as a failure, do NOT kill the process, do NOT take over. Either reattach a watcher or ask the user.
+- **Crash recovery**: look up session ID from registry, resume per Resume Protocol. Temporarily remove `2>/dev/null` on first resume after crash.
+- **Long-running tasks are normal.** A task taking 15, 30, or 60+ minutes does not justify killing Codex or taking over. The only true failure states are `crashed` (PID dead) and `error`. Everything else means Codex is still working.

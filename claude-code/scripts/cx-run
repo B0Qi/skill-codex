@@ -11,8 +11,9 @@
 # Options:
 #   --coord-id ID       Coord ID (default: cx_<timestamp>)
 #   --coord-dir DIR     .coord directory (default: .coord)
-#   --timeout SECONDS   Max wait time (default: 600)
+#   --timeout SECONDS   Max watch time; 0=disabled/indefinite (default: 0)
 #   --max-chars N       Truncate response (default: 12288)
+#   --cwd DIR           Working directory for codex (cd before launch)
 #   --resume SID        Resume a previous session instead of launching new
 #
 # Output: JSON to stdout on completion (from cx-parse watch)
@@ -24,8 +25,9 @@ set -uo pipefail
 
 COORD_ID="cx_$(date +%s)"
 COORD_DIR=".coord"
-TIMEOUT=600
+TIMEOUT=0  # 0 = disabled (watch indefinitely while PID alive). Use --timeout N to set a hard ceiling.
 MAX_CHARS=12288
+WORK_DIR=""
 RESUME_SID=""
 
 while [[ $# -gt 0 ]]; do
@@ -34,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --coord-dir) COORD_DIR="$2"; shift 2;;
     --timeout)   TIMEOUT="$2";   shift 2;;
     --max-chars) MAX_CHARS="$2";  shift 2;;
+    --cwd)       WORK_DIR="$2";  shift 2;;
     --resume)    RESUME_SID="$2"; shift 2;;
     --)          shift; break;;
     *)           break;;
@@ -55,12 +58,16 @@ if [ -n "$RESUME_SID" ]; then
       | python3 -c 'import sys,json; print(json.loads(sys.stdin.readline()).get("command",""))' 2>/dev/null)"
   fi
 
-  # Build resume command — inherit --json and --yolo from original
+  # Build resume command — correct syntax: codex exec resume <SID> "prompt" [flags]
   JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
-  codex exec --json --yolo --skip-git-repo-check --resume "$RESUME_SID" \
-    -p "Continue from where you left off. Complete the remaining work." \
+  _ORIG_DIR="$(pwd)"
+  [ -n "$WORK_DIR" ] && cd "$WORK_DIR"
+  codex exec resume "$RESUME_SID" \
+    "Continue from where you left off. Complete the remaining work." \
+    --json --yolo --skip-git-repo-check \
     >"$JSONL" 2>/dev/null &
   CMD_PID=$!
+  cd "$_ORIG_DIR"
 
   # Extract new session ID (resume may create a new one or reuse)
   SESSION_ID="$RESUME_SID"
@@ -73,7 +80,7 @@ if [ -n "$RESUME_SID" ]; then
 
   # Register resume
   printf '{"agent":"codex","coord_id":"%s","session_id":"%s","resumed_from":"%s","status":"running","cwd":"%s","created_at":"%s"}\n' \
-    "$COORD_ID" "$SESSION_ID" "$RESUME_SID" "$(pwd)" "$(date -Iseconds)" \
+    "$COORD_ID" "$SESSION_ID" "$RESUME_SID" "${WORK_DIR:-$(pwd)}" "$(date -Iseconds)" \
     >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
 
   # Watch
@@ -88,7 +95,7 @@ if [ -n "$RESUME_SID" ]; then
   # Update registry
   FINAL_STATUS="done"
   [ -f "$COORD_DIR/failed/$COORD_ID.json" ] && FINAL_STATUS="failed"
-  [ $EXIT_CODE -eq 4 ] && FINAL_STATUS="timeout"
+  [ $EXIT_CODE -eq 4 ] && FINAL_STATUS="watch_timeout"
 
   printf '{"agent":"codex","coord_id":"%s","session_id":"%s","status":"%s","updated_at":"%s"}\n' \
     "$COORD_ID" "$SESSION_ID" "$FINAL_STATUS" "$(date -Iseconds)" \
@@ -108,8 +115,12 @@ JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 
 # ── Launch ───────────────────────────────────────────────────────
 # Command after -- is expected to include --json and write JSONL to stdout.
+# Avoid subshell for --cwd: (cd && cmd)& captures subshell PID, not codex PID.
+_ORIG_DIR="$(pwd)"
+[ -n "$WORK_DIR" ] && cd "$WORK_DIR"
 "$@" >"$JSONL" 2>/dev/null &
 CMD_PID=$!
+cd "$_ORIG_DIR"
 
 # ── Extract session ID (max 30s) ────────────────────────────────
 SESSION_ID=""
@@ -124,7 +135,7 @@ done
 # Escape the command for JSON storage
 CMD_JSON="$(printf '%s' "$*" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')"
 printf '{"agent":"codex","coord_id":"%s","session_id":"%s","status":"running","command":%s,"cwd":"%s","mode":"serial","created_at":"%s"}\n' \
-  "$COORD_ID" "$SESSION_ID" "$CMD_JSON" "$(pwd)" "$(date -Iseconds)" \
+  "$COORD_ID" "$SESSION_ID" "$CMD_JSON" "${WORK_DIR:-$(pwd)}" "$(date -Iseconds)" \
   >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
 
 # ── Watch — blocks until completion ─────────────────────────────
@@ -139,7 +150,7 @@ EXIT_CODE=$?
 # ── Update registry ─────────────────────────────────────────────
 FINAL_STATUS="done"
 [ -f "$COORD_DIR/failed/$COORD_ID.json" ] && FINAL_STATUS="failed"
-[ $EXIT_CODE -eq 4 ] && FINAL_STATUS="timeout"
+[ $EXIT_CODE -eq 4 ] && FINAL_STATUS="watch_timeout"
 
 printf '{"agent":"codex","coord_id":"%s","session_id":"%s","status":"%s","updated_at":"%s"}\n' \
   "$COORD_ID" "$SESSION_ID" "$FINAL_STATUS" "$(date -Iseconds)" \
