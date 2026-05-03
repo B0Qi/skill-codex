@@ -4,16 +4,16 @@ The primary foreground extraction pattern is in SKILL.md. This file covers backg
 
 ## Parser Tool
 
-`cx-parse` is a zero-dependency Python 3 CLI at `$HOME/.claude/skills/codex/scripts/cx-parse`. Exit codes: 0=ok, 2=not-found/invalid, 3=parse-error. UUID validation is built in.
+`cx-parse` is a zero-dependency Python 3 CLI at `$HOME/.claude/skills/codex-cli/scripts/cx-parse`. Exit codes: 0=ok, 2=not-found/invalid, 3=parse-error. UUID validation is built in.
 
 ```bash
-CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+CX="$HOME/.claude/skills/codex-cli/scripts/cx-parse"
 ```
 
 ## Background Extraction
 
 ```bash
-CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+CX="$HOME/.claude/skills/codex-cli/scripts/cx-parse"
 JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 ERR="$(mktemp -t codex.XXXXXX.err)"
 

@@ -4,6 +4,10 @@ All notable changes to the Codex skill for Claude Code.
 
 ## [Unreleased]
 
+### Changed
+- **Renamed skill `codex` → `codex-cli`** to avoid collision with the official `codex` Claude Code plugin. Slash command becomes `/codex-cli`; install path is `~/.claude/skills/codex-cli/`. All internal `cx-run`/`cx-parse` references updated.
+- Default model bumped to `gpt-5.5` (frontier). Updated model table to current Codex CLI lineup: `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.2`.
+
 ### Added
 - **Parallel Worktree Mode**: Claude Code and Codex can now work simultaneously in separate git worktrees on different branches, with file ownership locking and an integration gate for safe merging.
 - **Session Registry** (`.coord/sessions.jsonl`): Persistent mapping of Codex session IDs to task descriptions, enabling recovery from timeouts, context loss, and conversation compression.

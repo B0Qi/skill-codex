@@ -15,12 +15,12 @@ Enable Claude Code to invoke the Codex CLI (`codex exec` and session resumes) fo
 
 ## Installation
 
-Download this repo and store the skill in ~/.claude/skills/codex
+Download this repo and store the skill in `~/.claude/skills/codex-cli` (renamed from `codex` to avoid clashing with the official `codex` plugin).
 
 ```
 git clone --depth 1 git@github.com:skills-directory/skill-codex.git /tmp/skills-temp && \
 mkdir -p ~/.claude/skills && \
-cp -r /tmp/skills-temp/ ~/.claude/skills/codex && \
+cp -r /tmp/skills-temp/ ~/.claude/skills/codex-cli && \
 rm -rf /tmp/skills-temp
 ```
 
@@ -38,12 +38,12 @@ Use codex to analyze this repository and suggest improvements for my claude code
 
 **Claude Code response:**
 Claude will activate the Codex skill and:
-1. Ask which model to use (default: `gpt-5.3-codex`) unless already specified in your prompt.
+1. Ask which model to use (default: `gpt-5.5`) unless already specified in your prompt.
 2. Ask which reasoning effort level (`xhigh`, `high`, `medium`, or `low`) unless already specified in your prompt.
 3. Select appropriate sandbox mode (defaults to `read-only` for analysis)
 4. Run a command like:
 ```bash
-codex exec -m gpt-5.3-codex \
+codex exec -m gpt-5.5 \
   --config model_reasoning_effort="high" \
   --sandbox read-only \
   --full-auto \

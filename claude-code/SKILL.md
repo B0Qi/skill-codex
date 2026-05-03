@@ -1,6 +1,6 @@
 ---
-name: codex
-description: Use when the user asks to run Codex CLI (codex exec, codex resume) or references OpenAI Codex for code analysis, refactoring, or automated editing. Also trigger when the user wants to delegate a coding task to Codex, mentions running tasks with GPT models, wants parallel agent execution in worktrees, or says things like "have codex do it", "send this to codex", or "let another agent handle this".
+name: codex-cli
+description: Use when the user asks to run Codex CLI (codex exec, codex resume) or references OpenAI Codex for code analysis, refactoring, or automated editing. Also trigger when the user wants to delegate a coding task to Codex, mentions running tasks with GPT models, wants parallel agent execution in worktrees, or says things like "have codex do it", "send this to codex", or "let another agent handle this". Distinct from the official `codex` plugin — this is the standalone skill that wraps `codex exec` directly.
 ---
 
 # Codex Skill Guide
@@ -119,9 +119,9 @@ Claude Code runs the whole thing with `run_in_background` and gets notified auto
 Use `cx-run` — a single command that wraps the entire lifecycle. Run it with `run_in_background`:
 
 ```bash
-$HOME/.claude/skills/codex/scripts/cx-run -- \
+$HOME/.claude/skills/codex-cli/scripts/cx-run -- \
   codex exec --json --yolo --skip-git-repo-check \
-  -m gpt-5.4 -c model_reasoning_effort='"high"' \
+  -m gpt-5.5 -c model_reasoning_effort='"high"' \
   "$PROMPT"
 ```
 
@@ -178,7 +178,7 @@ When Codex hits the model's max output tokens, the response is cut off mid-strea
 **Resume on truncation** — use `cx-run --resume`:
 
 ```bash
-$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID> -- \
+$HOME/.claude/skills/codex-cli/scripts/cx-run --resume <SESSION_ID> -- \
 ```
 
 `cx-run --resume` automatically: inherits `--json --yolo --skip-git-repo-check`, sends a "Continue from where you left off" prompt, registers in the session registry with `resumed_from`, and watches to completion.
@@ -202,7 +202,7 @@ When resuming a Codex session (after crash, truncation, context loss, or user re
 Use `cx-run --resume` — handles everything automatically:
 
 ```bash
-$HOME/.claude/skills/codex/scripts/cx-run --resume <SESSION_ID>
+$HOME/.claude/skills/codex-cli/scripts/cx-run --resume <SESSION_ID>
 ```
 
 This inherits `--json --yolo --skip-git-repo-check`, sends a "Continue from where you left off" prompt, registers the resume in the session registry, and watches to completion. Run with `run_in_background` just like the original launch.
@@ -289,23 +289,24 @@ Run `codex --help` or check OpenAI documentation for the latest model list. Comm
 
 | Model | Best For |
 | --- | --- |
-| `gpt-5.4` | Complex multi-file tasks, architecture (default) |
-| `gpt-5.3-codex` | Stable fallback, code-heavy tasks |
-| `gpt-5.3-codex-spark` | Quick edits, rapid iteration |
-| `gpt-5.1-codex-max` | Deep analysis, complex debugging |
-| `gpt-5.1-codex-mini` | Cost-sensitive, simple fixes |
+| `gpt-5.5` | Frontier — complex coding, research, real-world work (default) |
+| `gpt-5.4` | Strong everyday coding |
+| `gpt-5.4-mini` | Small, fast, cost-efficient for simpler tasks |
+| `gpt-5.3-codex` | Coding-optimized stable fallback |
+| `gpt-5.3-codex-spark` | Ultra-fast coding for quick edits |
+| `gpt-5.2` | Professional work and long-running agents |
 
 ## Running a Task
 
 1. **Guard check**: scan `.coord/running/` for active entries. If any exist, do NOT proceed — wait for the notification or resume the existing session.
 2. Confirm the Task Package is complete (include `Coord-ID`).
-3. Ask the user which model (default: `gpt-5.4`) and reasoning effort (`xhigh`/`high`/`medium`/`low`) in a **single prompt**.
+3. Ask the user which model (default: `gpt-5.5`) and reasoning effort (`xhigh`/`high`/`medium`/`low`) in a **single prompt**.
 4. **Prompt passing**: for long/multiline prompts (Task Packages), write to a temp file first: `PROMPT=$(cat /path/to/task_package.txt)`. NEVER use `-p` with multiline text.
 5. **Launch with `cx-run`** — a single `run_in_background` command that handles the entire lifecycle (launch, session registry, watch, state files):
    ```bash
-   $HOME/.claude/skills/codex/scripts/cx-run -- \
+   $HOME/.claude/skills/codex-cli/scripts/cx-run -- \
      codex exec --json --yolo --skip-git-repo-check \
-     -m gpt-5.4 -c model_reasoning_effort='"high"' \
+     -m gpt-5.5 -c model_reasoning_effort='"high"' \
      "$PROMPT"
    ```
    By default `cx-run` watches indefinitely until Codex completes or crashes. Do NOT add `--timeout` unless the user explicitly requests a hard ceiling.
@@ -329,7 +330,7 @@ Most local development doesn't need sandboxing, and sandbox restrictions cause f
 
 ```bash
 codex exec --yolo --skip-git-repo-check \
-  -m gpt-5.4 -c model_reasoning_effort='"high"' \
+  -m gpt-5.5 -c model_reasoning_effort='"high"' \
   "$PROMPT" 2>/dev/null
 ```
 
@@ -341,7 +342,7 @@ Use when working with untrusted codebases or when the user explicitly requests s
 codex exec --skip-git-repo-check \
   --sandbox workspace-write --full-auto \
   -c sandbox_workspace_write.network_access=true \
-  -m gpt-5.4 -c model_reasoning_effort='"high"' \
+  -m gpt-5.5 -c model_reasoning_effort='"high"' \
   "$PROMPT" 2>/dev/null
 ```
 

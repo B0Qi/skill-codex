@@ -48,11 +48,11 @@ grep -qxF '.coord/' .git/info/exclude 2>/dev/null || echo '.coord/' >> .git/info
 # Launch Codex in its worktree (ALWAYS verify and use absolute path for -C)
 WORKTREE="$(cd ../<project>-codex && pwd)"
 test -d "$WORKTREE" || { echo "ERROR: worktree not found at $WORKTREE"; exit 1; }
-CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+CX="$HOME/.claude/skills/codex-cli/scripts/cx-parse"
 JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 PROMPT="<task package prompt>"
 codex exec --json -C "$WORKTREE" --skip-git-repo-check \
-  -m gpt-5.4 -c model_reasoning_effort='"high"' \
+  -m gpt-5.5 -c model_reasoning_effort='"high"' \
   --yolo \
   "$PROMPT" >"$JSONL" 2>/dev/null
 SESSION_ID="$($CX session-id "$JSONL")"
@@ -92,7 +92,7 @@ Uses the shared Session Registry (`.coord/sessions.jsonl`). In parallel mode, ea
 Resume Codex in its worktree using the recorded session ID. Note: `resume` does NOT support `-C` — you must `cd` first:
 
 ```bash
-CX="$HOME/.claude/skills/codex/scripts/cx-parse"
+CX="$HOME/.claude/skills/codex-cli/scripts/cx-parse"
 JSONL="$(mktemp -t codex.XXXXXX.jsonl)"
 WORKTREE="$(cd ../<project>-codex && pwd)"
 cd "$WORKTREE" && codex exec --json --yolo \
